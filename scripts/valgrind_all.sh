@@ -19,6 +19,7 @@ BIN="$BUILD_DIR/test_tensor_vg"
 BIN_GRAPH="$BUILD_DIR/test_graph_loader_vg"
 BIN_MATMUL="$BUILD_DIR/test_matmul_vg"
 BIN_SPMM="$BUILD_DIR/test_spmm_vg"
+BIN_ACTIVATIONS="$BUILD_DIR/test_activations_vg"
 LOG_DIR="$PROJ_ROOT/build/valgrind/logs"
 SRC_INCLUDE="-I $PROJ_ROOT/include"
 
@@ -57,14 +58,23 @@ g++ -std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer \
     "$PROJ_ROOT/tests/test_spmm.cpp" \
     -o "$BIN_SPMM"
 
+g++ -std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer \
+    $SRC_INCLUDE \
+    "$PROJ_ROOT/src/tensor.cpp" \
+    "$PROJ_ROOT/src/ops.cpp" \
+    "$PROJ_ROOT/tests/test_activations.cpp" \
+    -o "$BIN_ACTIVATIONS"
+
 echo "  Binary (tensor):       $BIN"
 echo "  Binary (graph_loader): $BIN_GRAPH"
 echo "  Binary (matmul):       $BIN_MATMUL"
+echo "  Binary (spmm):         $BIN_SPMM"
+echo "  Binary (activations):  $BIN_ACTIVATIONS"
 echo "  Size (tensor):       $(du -sh "$BIN" | cut -f1)"
 echo "  Size (graph_loader): $(du -sh "$BIN_GRAPH" | cut -f1)"
 echo "  Size (matmul):       $(du -sh "$BIN_MATMUL" | cut -f1)"
-echo "  Binary (spmm):         $BIN_SPMM"
 echo "  Size (spmm):         $(du -sh "$BIN_SPMM" | cut -f1)"
+echo "  Size (activations):  $(du -sh "$BIN_ACTIVATIONS" | cut -f1)"
 
 # ── Step 2: Verify clean run first ────────────────────────────────────────────
 echo ""
@@ -79,6 +89,8 @@ echo "  -- test_matmul --"
 "$BIN_MATMUL" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
 echo "  -- test_spmm --"
 "$BIN_SPMM" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
+echo "  -- test_activations --"
+"$BIN_ACTIVATIONS" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
 
 # ── Step 3: Memcheck ──────────────────────────────────────────────────────────
 echo ""
@@ -158,6 +170,24 @@ valgrind \
 
 echo ""
 cat "$MEMCHECK_LOG_SPMM" | grep -E "ERROR SUMMARY|LEAK SUMMARY|definitely lost|indirectly lost|possibly lost|still reachable|suppressed" || true
+MEMCHECK_LOG_ACTIVATIONS="$LOG_DIR/memcheck_activations.log"
+
+echo ""
+echo "  -- test_activations --"
+valgrind \
+    --tool=memcheck \
+    --leak-check=full \
+    --show-leak-kinds=all \
+    --track-origins=yes \
+    --errors-for-leak-kinds=all \
+    --error-exitcode=1 \
+    --log-file="$MEMCHECK_LOG_ACTIVATIONS" \
+    "$BIN_ACTIVATIONS" > /dev/null 2>&1 \
+    && echo "  [PASS] Memcheck (activations): no errors" \
+    || { echo "  [FAIL] Memcheck (activations) detected issues — see $MEMCHECK_LOG_ACTIVATIONS"; cat "$MEMCHECK_LOG_ACTIVATIONS" | grep -A3 "ERROR SUMMARY\|definitely lost\|Invalid"; }
+
+echo ""
+cat "$MEMCHECK_LOG_ACTIVATIONS" | grep -E "ERROR SUMMARY|LEAK SUMMARY|definitely lost|indirectly lost|possibly lost|still reachable|suppressed" || true
 # ── Step 4: Helgrind ──────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════"
@@ -222,6 +252,21 @@ valgrind \
 
 echo ""
 cat "$HELGRIND_LOG_SPMM" | grep "ERROR SUMMARY" || true
+
+HELGRIND_LOG_ACTIVATIONS="$LOG_DIR/helgrind_activations.log"
+
+echo ""
+echo "  -- test_activations --"
+valgrind \
+    --tool=helgrind \
+    --error-exitcode=1 \
+    --log-file="$HELGRIND_LOG_ACTIVATIONS" \
+    "$BIN_ACTIVATIONS" > /dev/null 2>&1 \
+    && echo "  [PASS] Helgrind (activations): no threading errors" \
+    || { echo "  [FAIL] Helgrind (activations) detected threading issues — see $HELGRIND_LOG_ACTIVATIONS"; cat "$HELGRIND_LOG_ACTIVATIONS" | grep -A3 "ERROR SUMMARY"; }
+
+echo ""
+cat "$HELGRIND_LOG_ACTIVATIONS" | grep "ERROR SUMMARY" || true
 
 # ── Step 5: Callgrind (perf profiling) ────────────────────────────────────────
 echo ""

@@ -11,7 +11,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | Phase | Title | Status |
 |-------|-------|--------|
 | **1** | Hybrid Tensor Core | ✅ Complete |
-| 2 | Sparse Matrix Operations | 🔜 Planned |
+| **2** | Graph Data Loader | ✅ Complete |
 | 3 | GNN Layer Primitives | 🔜 Planned |
 | 4 | Parallel Execution Engine | 🔜 Planned |
 
@@ -91,11 +91,19 @@ TinyGNN/
 ├── CMakeLists.txt              # C++17 build system (CMake)
 ├── include/
 │   └── tinygnn/
-│       └── tensor.hpp          # StorageFormat enum + Tensor struct (public API)
+│       ├── tensor.hpp          # StorageFormat enum + Tensor struct
+│       └── graph_loader.hpp    # GraphData + GraphLoader (CSV → CSR pipeline)
 ├── src/
-│   └── tensor.cpp              # Tensor implementation
-└── tests/
-    └── test_tensor.cpp         # Dependency-free unit tests (104 assertions)
+│   ├── tensor.cpp              # Tensor implementation
+│   └── graph_loader.cpp        # CSV parser + edge-list-to-CSR conversion
+├── tests/
+│   ├── test_tensor.cpp         # Phase 1 tests (104 assertions)
+│   └── test_graph_loader.cpp   # Phase 2 tests (196 assertions)
+└── scripts/
+    ├── sanitizers.sh           # ASan + UBSan testing
+    ├── valgrind_all.sh         # Memcheck + Helgrind + Callgrind
+    ├── run_sanitizers_phase2.sh # WSL-compatible sanitizer runner
+    └── run_valgrind_phase2.sh  # WSL-compatible valgrind runner
 ```
 
 ---
@@ -115,13 +123,93 @@ ctest --test-dir build --output-on-failure
 
 ### Directly with g++ (MinGW / Linux)
 ```bash
-# Compile
+# Phase 1 — Tensor tests
 g++ -std=c++17 -Wall -Wextra -static -I include \
     src/tensor.cpp tests/test_tensor.cpp -o build/test_tensor
-
-# Run tests
 ./build/test_tensor
+
+# Phase 2 — GraphLoader tests
+g++ -std=c++17 -Wall -Wextra -static -I include \
+    src/tensor.cpp src/graph_loader.cpp tests/test_graph_loader.cpp \
+    -o build/test_graph_loader
+./build/test_graph_loader
 ```
+
+---
+
+## Phase 2 — Graph Data Loader (Ingestion Pipeline)
+
+### Goal
+Load irregular graph structures from CSV and convert them to hardware-friendly sorted CSR format for GNN inference.
+
+### Design
+
+#### `GraphLoader` Class
+```cpp
+class GraphLoader {
+public:
+    static std::vector<std::pair<int32_t, int32_t>>
+        parse_edges(const std::string& path);        // edge-list CSV → pairs
+
+    static Tensor parse_features(const std::string& path);  // feature CSV → Dense tensor
+
+    static Tensor edge_list_to_csr(                  // raw edges → sorted CSR
+        const std::vector<std::pair<int32_t, int32_t>>& edges,
+        std::size_t num_nodes);
+
+    static GraphData load(const std::string& edges_path,    // full pipeline
+                          const std::string& features_path);
+};
+```
+
+#### CSR Conversion Algorithm — O(E + V + E·log(E/V))
+```
+Step 1: Count out-degree per node         — O(E)
+Step 2: Build row_ptr via prefix sum      — O(V)
+Step 3: Fill col_ind via offset insertion  — O(E)
+Step 4: Sort col_ind within each row      — O(E·log(E/V)) amortised
+```
+
+#### CSV Format Support
+- Automatic header row detection (skips non-numeric first lines)
+- Both LF and CRLF line endings
+- Whitespace-tolerant parsing
+- Out-of-order node IDs with gap zero-filling
+
+### Results (Cora-Scale)
+
+```
+Nodes:     2,708
+Edges:     10,556
+Features:  1,433 per node
+
+Adjacency: Tensor(2708x2708, SparseCSR, 95,284 bytes)
+Features:  Tensor(2708x1433, Dense, 15,522,256 bytes)
+```
+
+### Test Suite
+196 assertions across 37 test functions.
+
+| Category | Tests | Assertions |
+|----------|-------|------------|
+| Edge CSV parsing | 6 | header, no-header, CRLF, self-loops, trailing blanks |
+| Feature CSV parsing | 6 | ordered, unordered, sparse IDs, negatives |
+| CSR conversion | 8 | exact arrays, sorting, empty rows, memory footprint |
+| Full load pipeline | 4 | node-0 neighbors, all-nodes verify, feature expansion |
+| Cora-scale validation | 3 | 2708 nodes / 10556 edges / 1433 features |
+| Error handling | 10 | file-not-found, malformed, negative IDs, bounds |
+
+```
+Total : 196
+Passed: 196
+Failed: 0
+```
+
+### Memory Safety Verification
+- **AddressSanitizer + LeakSanitizer**: PASS
+- **UndefinedBehaviorSanitizer**: PASS
+- **Combined ASan + UBSan**: PASS
+- **Valgrind Memcheck**: 0 errors, 0 leaks
 
 ---
 

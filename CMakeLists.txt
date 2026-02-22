@@ -42,3 +42,7 @@ add_test(NAME GraphLoaderTests COMMAND test_graph_loader)
 add_executable(test_matmul tests/test_matmul.cpp)
 target_link_libraries(test_matmul PRIVATE tinygnn_core)
 add_test(NAME MatmulTests COMMAND test_matmul)
+
+add_executable(test_spmm tests/test_spmm.cpp)
+target_link_libraries(test_spmm PRIVATE tinygnn_core)
+add_test(NAME SpmmTests COMMAND test_spmm)

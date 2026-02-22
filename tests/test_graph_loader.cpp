@@ -10,7 +10,9 @@
 //    4. Full pipeline (load)               (tests 21 – 24)
 //    5. Cora-scale validation              (tests 25 – 27)
 //    6. Reddit-scale validation            (tests 28 – 31)
-//    7. Error handling                     (tests 32 – 41)
+//    7. Actual Cora dataset                (tests 32 – 35)
+//    8. Actual Reddit dataset              (tests 36 – 39)
+//    9. Error handling                     (tests 40 – 49)
 //
 // ============================================================================
 
@@ -1218,10 +1220,329 @@ void test_reddit_scale_node0_neighbors() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  7.  ERROR HANDLING
+//  7.  ACTUAL CORA DATASET
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  Tests against the real Cora citation dataset (McCallum et al. 2000).
+//  Requires: datasets/cora/edges.csv and datasets/cora/node_features.csv
+//  (Run `python3 scripts/fetch_datasets.py` to download.)
+//
+//  Known properties:
+//    Nodes    : 2,708  (unique papers)
+//    Edges    : 5,429  (directed citation links)
+//    Features : 1,433  (binary bag-of-words indicators)
+//
 // ════════════════════════════════════════════════════════════════════════════
 
-// 28. File not found
+namespace {
+
+bool dataset_available(const std::string& name) {
+    std::ifstream ef("datasets/" + name + "/edges.csv");
+    std::ifstream ff("datasets/" + name + "/node_features.csv");
+    return ef.is_open() && ff.is_open();
+}
+
+GraphData& cached_cora() {
+    static GraphData gd = GraphLoader::load(
+        "datasets/cora/edges.csv", "datasets/cora/node_features.csv");
+    return gd;
+}
+
+GraphData& cached_reddit() {
+    static GraphData gd = []() -> GraphData {
+        std::cout << "    [Loading actual Reddit dataset — may take several minutes]\n";
+        auto t0 = std::chrono::steady_clock::now();
+        auto g = GraphLoader::load(
+            "datasets/reddit/edges.csv",
+            "datasets/reddit/node_features.csv");
+        auto t1 = std::chrono::steady_clock::now();
+        auto sec = std::chrono::duration_cast<std::chrono::seconds>(t1 - t0).count();
+        std::cout << "    [Reddit loaded in " << sec << " s]\n";
+        return g;
+    }();
+    return gd;
+}
+
+}  // anonymous namespace
+
+// 32. Actual Cora: load and verify dataset dimensions
+void test_cora_actual_load() {
+    if (!dataset_available("cora")) {
+        std::cout << "    [SKIP] datasets/cora/ not found "
+                     "(run: python3 scripts/fetch_datasets.py)\n";
+        return;
+    }
+
+    const auto& gd = cached_cora();
+
+    ASSERT_EQ(gd.num_nodes,    2708u);
+    ASSERT_EQ(gd.num_edges,    5429u);
+    ASSERT_EQ(gd.num_features, 1433u);
+
+    ASSERT_TRUE(gd.adjacency.format() == StorageFormat::SparseCSR);
+    ASSERT_EQ(gd.adjacency.rows(), 2708u);
+    ASSERT_EQ(gd.adjacency.cols(), 2708u);
+    ASSERT_EQ(gd.adjacency.nnz(),  5429u);
+
+    ASSERT_TRUE(gd.node_features.format() == StorageFormat::Dense);
+    ASSERT_EQ(gd.node_features.rows(), 2708u);
+    ASSERT_EQ(gd.node_features.cols(), 1433u);
+
+    std::cout << "    Adjacency: " << gd.adjacency.repr() << "\n";
+    std::cout << "    Features:  " << gd.node_features.repr() << "\n";
+}
+
+// 33. Actual Cora: CSR structural invariants
+void test_cora_actual_csr_invariants() {
+    if (!dataset_available("cora")) {
+        std::cout << "    [SKIP] datasets/cora/ not found\n";
+        return;
+    }
+
+    const auto& gd = cached_cora();
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    ASSERT_EQ(rp.size(), 2709u);
+    ASSERT_EQ(rp.front(), 0);
+    ASSERT_EQ(rp.back(),  static_cast<int32_t>(5429));
+
+    bool non_dec = true;
+    for (std::size_t i = 1; i < rp.size(); ++i) {
+        if (rp[i] < rp[i - 1]) { non_dec = false; break; }
+    }
+    ASSERT_TRUE(non_dec);
+
+    bool cols_ok = true;
+    for (auto c : ci) {
+        if (c < 0 || c >= 2708) { cols_ok = false; break; }
+    }
+    ASSERT_TRUE(cols_ok);
+
+    bool sorted_ok = true;
+    for (std::size_t r = 0; r < 2708; ++r) {
+        for (int32_t j = rp[r]; j + 1 < rp[r + 1]; ++j) {
+            if (ci[static_cast<std::size_t>(j)] >
+                ci[static_cast<std::size_t>(j + 1)]) {
+                sorted_ok = false;
+                break;
+            }
+        }
+        if (!sorted_ok) break;
+    }
+    ASSERT_TRUE(sorted_ok);
+}
+
+// 34. Actual Cora: features are all binary (0 or 1 bag-of-words)
+void test_cora_actual_features_binary() {
+    if (!dataset_available("cora")) {
+        std::cout << "    [SKIP] datasets/cora/ not found\n";
+        return;
+    }
+
+    const auto& gd = cached_cora();
+    const auto& data = gd.node_features.data();
+
+    ASSERT_EQ(gd.node_features.rows(), 2708u);
+    ASSERT_EQ(gd.node_features.cols(), 1433u);
+
+    bool all_binary = true;
+    for (float v : data) {
+        if (v != 0.0f && v != 1.0f) { all_binary = false; break; }
+    }
+    ASSERT_TRUE(all_binary);
+
+    // Sum > 0: at least some words are present
+    double sum = 0.0;
+    for (float v : data) sum += static_cast<double>(v);
+    ASSERT_TRUE(sum > 0.0);
+
+    std::cout << "    Feature sum: " << static_cast<std::size_t>(sum)
+              << " / " << data.size() << " entries are 1\n";
+}
+
+// 35. Actual Cora: Node 0 neighbors match raw edge file
+void test_cora_actual_node0_neighbors() {
+    if (!dataset_available("cora")) {
+        std::cout << "    [SKIP] datasets/cora/ not found\n";
+        return;
+    }
+
+    // Ground truth from raw CSV
+    auto raw = GraphLoader::parse_edges("datasets/cora/edges.csv");
+    std::vector<int32_t> expected;
+    for (const auto& [src, dst] : raw) {
+        if (src == 0) expected.push_back(dst);
+    }
+    std::sort(expected.begin(), expected.end());
+
+    // CSR from loaded graph
+    const auto& gd = cached_cora();
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    std::vector<int32_t> actual;
+    for (int32_t j = rp[0]; j < rp[1]; ++j) {
+        actual.push_back(ci[static_cast<std::size_t>(j)]);
+    }
+
+    ASSERT_EQ(actual.size(), expected.size());
+    ASSERT_TRUE(actual == expected);
+
+    std::cout << "    Cora Node 0: " << actual.size() << " neighbors\n";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  8.  ACTUAL REDDIT DATASET
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  Tests against the real Reddit dataset (Hamilton et al. 2017, GraphSAGE).
+//  Requires: datasets/reddit/edges.csv and datasets/reddit/node_features.csv
+//  (Run `python3 scripts/fetch_datasets.py` to download.)
+//
+//  Known properties:
+//    Nodes    : 232,965  (Reddit posts)
+//    Edges    : 114,615,892  (directed post-to-post links)
+//    Features : 602  (GloVe word embeddings)
+//
+//  NOTE: Loading the actual Reddit dataset takes several minutes and ~2 GB RAM.
+//        The GraphData is cached: loaded once, shared across all Reddit tests.
+//
+// ════════════════════════════════════════════════════════════════════════════
+
+// 36. Actual Reddit: load and verify dataset dimensions
+void test_reddit_actual_load() {
+    if (!dataset_available("reddit")) {
+        std::cout << "    [SKIP] datasets/reddit/ not found "
+                     "(run: python3 scripts/fetch_datasets.py)\n";
+        return;
+    }
+
+    const auto& gd = cached_reddit();
+
+    ASSERT_EQ(gd.num_nodes,    232965u);
+    ASSERT_EQ(gd.num_edges,    114615892u);
+    ASSERT_EQ(gd.num_features, 602u);
+
+    ASSERT_TRUE(gd.adjacency.format() == StorageFormat::SparseCSR);
+    ASSERT_EQ(gd.adjacency.rows(), 232965u);
+    ASSERT_EQ(gd.adjacency.cols(), 232965u);
+    ASSERT_EQ(gd.adjacency.nnz(),  114615892u);
+
+    ASSERT_TRUE(gd.node_features.format() == StorageFormat::Dense);
+    ASSERT_EQ(gd.node_features.rows(), 232965u);
+    ASSERT_EQ(gd.node_features.cols(), 602u);
+
+    std::cout << "    Adjacency: " << gd.adjacency.repr() << "\n";
+    std::cout << "    Features:  " << gd.node_features.repr() << "\n";
+}
+
+// 37. Actual Reddit: CSR structural invariants
+void test_reddit_actual_csr_invariants() {
+    if (!dataset_available("reddit")) {
+        std::cout << "    [SKIP] datasets/reddit/ not found\n";
+        return;
+    }
+
+    const auto& gd = cached_reddit();
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    ASSERT_EQ(rp.size(), 232966u);
+    ASSERT_EQ(rp.front(), 0);
+    ASSERT_EQ(rp.back(),  static_cast<int32_t>(114615892));
+
+    bool non_dec = true;
+    for (std::size_t i = 1; i < rp.size(); ++i) {
+        if (rp[i] < rp[i - 1]) { non_dec = false; break; }
+    }
+    ASSERT_TRUE(non_dec);
+
+    bool cols_ok = true;
+    for (auto c : ci) {
+        if (c < 0 || static_cast<std::size_t>(c) >= 232965) {
+            cols_ok = false; break;
+        }
+    }
+    ASSERT_TRUE(cols_ok);
+
+    // Per-row sort (sample every 1000th row)
+    bool sorted_ok = true;
+    for (std::size_t r = 0; r < 232965; r += 1000) {
+        for (int32_t j = rp[r]; j + 1 < rp[r + 1]; ++j) {
+            if (ci[static_cast<std::size_t>(j)] >
+                ci[static_cast<std::size_t>(j + 1)]) {
+                sorted_ok = false;
+                break;
+            }
+        }
+        if (!sorted_ok) break;
+    }
+    ASSERT_TRUE(sorted_ok);
+}
+
+// 38. Actual Reddit: features are finite GloVe embeddings
+void test_reddit_actual_feature_properties() {
+    if (!dataset_available("reddit")) {
+        std::cout << "    [SKIP] datasets/reddit/ not found\n";
+        return;
+    }
+
+    const auto& gd = cached_reddit();
+    const auto& data = gd.node_features.data();
+
+    ASSERT_EQ(gd.node_features.rows(), 232965u);
+    ASSERT_EQ(gd.node_features.cols(), 602u);
+
+    // All values must be finite (not NaN or Inf)
+    bool all_finite = true;
+    for (float v : data) {
+        if (!std::isfinite(v)) { all_finite = false; break; }
+    }
+    ASSERT_TRUE(all_finite);
+
+    // GloVe embeddings have real-valued entries — at least some non-zero
+    bool has_nonzero = false;
+    for (float v : data) {
+        if (v != 0.0f) { has_nonzero = true; break; }
+    }
+    ASSERT_TRUE(has_nonzero);
+}
+
+// 39. Actual Reddit: Node 0 has neighbors in sorted order within range
+void test_reddit_actual_node0_neighbors() {
+    if (!dataset_available("reddit")) {
+        std::cout << "    [SKIP] datasets/reddit/ not found\n";
+        return;
+    }
+
+    const auto& gd = cached_reddit();
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    const auto count = static_cast<std::size_t>(rp[1] - rp[0]);
+    ASSERT_TRUE(count > 0u);
+
+    // Verify sorted and in range
+    bool ok = true;
+    for (int32_t j = rp[0]; j < rp[1]; ++j) {
+        const auto c = ci[static_cast<std::size_t>(j)];
+        if (c < 0 || static_cast<std::size_t>(c) >= 232965) { ok = false; break; }
+        if (j > rp[0] &&
+            ci[static_cast<std::size_t>(j - 1)] > c) {
+            ok = false; break;
+        }
+    }
+    ASSERT_TRUE(ok);
+
+    std::cout << "    Reddit Node 0: " << count << " neighbors\n";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  9.  ERROR HANDLING
+// ════════════════════════════════════════════════════════════════════════════
+
+// 40. File not found
 void test_error_file_not_found() {
     ASSERT_THROWS(
         GraphLoader::parse_edges("nonexistent_edges_file.csv"),
@@ -1233,7 +1554,7 @@ void test_error_file_not_found() {
     );
 }
 
-// 29. Empty file
+// 41. Empty file
 void test_error_empty_file() {
     TempFile f("");
     ASSERT_THROWS(
@@ -1242,7 +1563,7 @@ void test_error_empty_file() {
     );
 }
 
-// 30. Malformed edge line (no comma)
+// 42. Malformed edge line (no comma)
 void test_error_malformed_edge() {
     TempFile f("0 1\n");
     ASSERT_THROWS(
@@ -1251,7 +1572,7 @@ void test_error_malformed_edge() {
     );
 }
 
-// 31. Non-integer in edge file
+// 43. Non-integer in edge file
 void test_error_non_integer_edge() {
     TempFile f("0,abc\n");
     ASSERT_THROWS(
@@ -1260,7 +1581,7 @@ void test_error_non_integer_edge() {
     );
 }
 
-// 32. Negative node ID in edges
+// 44. Negative node ID in edges
 void test_error_negative_edge_id() {
     TempFile f("-1,2\n");
     ASSERT_THROWS(
@@ -1269,7 +1590,7 @@ void test_error_negative_edge_id() {
     );
 }
 
-// 33. Negative node ID in features
+// 45. Negative node ID in features
 void test_error_negative_feature_id() {
     TempFile f("-1,1.0,2.0\n");
     ASSERT_THROWS(
@@ -1278,7 +1599,7 @@ void test_error_negative_feature_id() {
     );
 }
 
-// 34. Inconsistent feature counts
+// 46. Inconsistent feature counts
 void test_error_inconsistent_features() {
     TempFile f(
         "0,1.0,2.0\n"
@@ -1290,7 +1611,7 @@ void test_error_inconsistent_features() {
     );
 }
 
-// 35. Edge out of range for CSR conversion
+// 47. Edge out of range for CSR conversion
 void test_error_edge_out_of_range() {
     std::vector<std::pair<int32_t, int32_t>> edges = {{0, 5}};
     ASSERT_THROWS(
@@ -1299,7 +1620,7 @@ void test_error_edge_out_of_range() {
     );
 }
 
-// 36. Header-only edges file (no data rows)
+// 48. Header-only edges file (no data rows)
 void test_error_header_only_edges() {
     TempFile f("src,dst\n");
     // Should parse 0 edges (not throw), because an empty edge list
@@ -1308,7 +1629,7 @@ void test_error_header_only_edges() {
     ASSERT_EQ(edges.size(), 0u);
 }
 
-// 37. Header-only features file (no data rows)
+// 49. Header-only features file (no data rows)
 void test_error_header_only_features() {
     TempFile f("node_id,f0,f1\n");
     ASSERT_THROWS(
@@ -1370,6 +1691,19 @@ int main() {
     RUN_TEST(test_reddit_scale_pipeline_counts);
     RUN_TEST(test_reddit_scale_csr_invariants);
     RUN_TEST(test_reddit_scale_node0_neighbors);
+
+    std::cout << "\n-- Actual Cora Dataset ------------------\n";
+    RUN_TEST(test_cora_actual_load);
+    RUN_TEST(test_cora_actual_csr_invariants);
+    RUN_TEST(test_cora_actual_features_binary);
+    RUN_TEST(test_cora_actual_node0_neighbors);
+
+    std::cout << "\n-- Actual Reddit Dataset ----------------\n";
+    std::cout << "  NOTE: Loads ~2.7 GB of CSV data. May take 5-15 min.\n";
+    RUN_TEST(test_reddit_actual_load);
+    RUN_TEST(test_reddit_actual_csr_invariants);
+    RUN_TEST(test_reddit_actual_feature_properties);
+    RUN_TEST(test_reddit_actual_node0_neighbors);
 
     std::cout << "\n-- Error Handling -----------------------\n";
     RUN_TEST(test_error_file_not_found);

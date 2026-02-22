@@ -242,8 +242,10 @@ static void require_dense(const Tensor& X, const char* func_name) {
 //  relu_inplace  — f(x) = max(0, x)
 // ============================================================================
 //
-//  Single pass over all elements.  Branchless on most compilers: the
-//  ternary compiles to a conditional move (cmov) or max instruction.
+//  Single pass over all elements.  std::max(0, x) compiles to a single
+//  MAXSS (scalar) or MAXPS (packed/SIMD) instruction on x86 with -O2,
+//  avoiding any branch and allowing the loop to be auto-vectorised over
+//  4 or 8 floats per iteration using SSE/AVX.
 //
 //  Used in virtually every GNN architecture:
 //    GCN:        H' = ReLU(  D^{-½} A D^{-½} H W  )
@@ -258,7 +260,8 @@ void relu_inplace(Tensor& X) {
     const std::size_t n = X.data().size();
 
     for (std::size_t i = 0; i < n; ++i) {
-        if (d[i] < 0.0f) d[i] = 0.0f;
+        // std::max typically lowers to a single MAX instruction (no branch)
+        d[i] = std::max(0.0f, d[i]);
     }
 }
 
@@ -272,6 +275,10 @@ void relu_inplace(Tensor& X) {
 //  Unlike ReLU, Leaky ReLU allows a small gradient for negative inputs,
 //  preventing "dead neuron" problems in deep GNN stacks.
 //
+//  The ternary form (instead of if) enables the compiler to emit a
+//  conditional-move (CMOV) — branchless, SIMD-friendly — since both
+//  branches are cheap arithmetic with no function calls.
+//
 // ============================================================================
 void leaky_relu_inplace(Tensor& X, float alpha) {
     require_dense(X, "leaky_relu_inplace");
@@ -280,7 +287,8 @@ void leaky_relu_inplace(Tensor& X, float alpha) {
     const std::size_t n = X.data().size();
 
     for (std::size_t i = 0; i < n; ++i) {
-        if (d[i] < 0.0f) d[i] *= alpha;
+        // Ternary enables CMOV / branchless vectorisation (both sides are cheap)
+        d[i] = d[i] >= 0.0f ? d[i] : alpha * d[i];
     }
 }
 

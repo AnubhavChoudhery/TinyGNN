@@ -17,6 +17,7 @@ INC="-I $PROJ_ROOT/include"
 SRCS_TENSOR="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/tests/test_tensor.cpp"
 SRCS_GRAPH="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT/tests/test_graph_loader.cpp"
 SRCS_MATMUL="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_matmul.cpp"
+SRCS_SPMM="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_spmm.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -92,6 +93,16 @@ run_config "matmul_ubsan" "-fsanitize=undefined" "$SRCS_MATMUL"
 
 # 9. Combined ASan + UBSan
 run_config "matmul_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_MATMUL"
+
+# ── SpMM tests ──
+# 10. AddressSanitizer + LeakSanitizer
+run_config "spmm_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_SPMM"
+
+# 11. UndefinedBehaviorSanitizer
+run_config "spmm_ubsan" "-fsanitize=undefined" "$SRCS_SPMM"
+
+# 12. Combined ASan + UBSan
+run_config "spmm_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_SPMM"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

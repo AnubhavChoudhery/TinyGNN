@@ -33,10 +33,14 @@ TinyGNN/
 │   └── ops.cpp                 # matmul implementation (i,k,j loop order)
 ├── tests/
 │   ├── test_tensor.cpp         # Phase 1 -- 104 assertions
-│   ├── test_graph_loader.cpp   # Phase 2 -- 196 assertions
+│   ├── test_graph_loader.cpp   # Phase 2 -- 269 assertions
 │   └── test_matmul.cpp         # Phase 3 -- 268 assertions
+├── datasets/                   # downloaded via scripts/fetch_datasets.py
+│   ├── cora/                   # 2,708 nodes, 5,429 edges, 1,433 features
+│   └── reddit/                 # 232,965 nodes, 114,615,892 edges, 602 features
 └── scripts/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
+    ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
     ├── sanitizers.sh           # ASan + UBSan (9 configs, all 3 phases)
     └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 3 phases)
 ```
@@ -79,6 +83,29 @@ g++ -std=c++17 -Wall -Wextra -I include \
 bash scripts/sanitizers.sh       # 9 sanitizer configs across all phases
 bash scripts/valgrind_all.sh     # Memcheck + Helgrind + Callgrind
 ```
+
+---
+
+## Datasets
+
+TinyGNN tests against two real-world graph datasets. Download them with the included Python script:
+
+```bash
+# Cora only (no extra Python deps, ~170 KB download)
+python3 scripts/fetch_datasets.py --cora-only
+
+# Both Cora and Reddit (needs numpy + scipy, ~200 MB download)
+pip install numpy scipy
+python3 scripts/fetch_datasets.py
+```
+
+| Dataset | Source | Nodes | Edges | Features | CSV size |
+|---------|--------|-------|-------|----------|----------|
+| Cora | LINQS (McCallum et al. 2000) | 2,708 | 5,429 | 1,433 (binary bag-of-words) | 7.5 MB |
+| Reddit | DGL / GraphSAGE (Hamilton et al. 2017) | 232,965 | 114,615,892 | 602 (GloVe embeddings) | 2.7 GB |
+
+Files are placed in `datasets/cora/` and `datasets/reddit/` (gitignored).
+Tests that require actual datasets skip gracefully when the files are not present.
 
 ---
 
@@ -229,7 +256,39 @@ Full file-pipeline test:
 Node 0 neighbors: 455 (CSR traversal matches raw CSV exactly)
 ```
 
-### Test suite -- 225 assertions, 41 test functions, 0 failures
+### Results (actual Cora dataset)
+
+The real Cora citation network (McCallum et al. 2000): 2,708 papers linked by 5,429 directed citations, with 1,433 binary bag-of-words features per paper.
+
+```
+Nodes:     2,708
+Edges:     5,429
+Features:  1,433 per node (binary)
+
+Adjacency: Tensor(2708x2708, SparseCSR, 54,268 bytes)     (~53 KB)
+Features:  Tensor(2708x1433, Dense,     15,522,256 bytes)  (~14.8 MB)
+
+Feature density: 49,216 / 3,880,564 entries are 1  (1.27%)
+Node 0 neighbors: 3 (CSR traversal matches raw CSV exactly)
+```
+
+### Results (actual Reddit dataset)
+
+The real Reddit post network (Hamilton et al. 2017, GraphSAGE): 232,965 posts linked by 114,615,892 directed edges, with 602-dimensional GloVe word embeddings per post.
+
+```
+Nodes:     232,965
+Edges:     114,615,892
+Features:  602 per node (GloVe float)
+
+Adjacency: Tensor(232965x232965, SparseCSR, 917,859,000 bytes)  (~875 MB)
+Features:  Tensor(232965x602,   Dense,      560,979,720 bytes)  (~535 MB)
+
+GraphLoader::load() time: 157 s  (WSL, Ubuntu 24.04, GCC 13.3)
+Node 0 neighbors: 2,204
+```
+
+### Test suite -- 269 assertions, 49 test functions, 0 failures
 
 | Category | Functions | Covers |
 |----------|-----------|--------|
@@ -239,11 +298,13 @@ Node 0 neighbors: 455 (CSR traversal matches raw CSV exactly)
 | Full load pipeline | 4 | node-0 neighbors, all-nodes verify, feature zero-expansion |
 | Cora-scale validation | 3 | 2708 nodes / 10556 edges / 1433 features / row_ptr invariants |
 | Reddit-scale validation | 4 | 232,965 nodes / 114,615,892 edges / in-memory CSR + full pipeline + node-0 match |
+| Actual Cora dataset | 4 | 2,708 nodes / 5,429 real citation edges / binary features / node-0 match |
+| Actual Reddit dataset | 4 | 232,965 nodes / 114,615,892 real edges / GloVe features / CSR invariants |
 | Error handling | 10 | file-not-found, malformed lines, negative IDs, out-of-range |
 
 ```
-Total : 225
-Passed: 225
+Total : 269
+Passed: 269
 Failed: 0
 ```
 
@@ -346,9 +407,9 @@ Failed: 0
 | Phase | Test file | Functions | Assertions | Result |
 |-------|-----------|-----------|------------|--------|
 | 1 | test_tensor.cpp | 18 | 104 | 104 / 104 |
-| 2 | test_graph_loader.cpp | 41 | 225 | 225 / 225 |
+| 2 | test_graph_loader.cpp | 49 | 269 | 269 / 269 |
 | 3 | test_matmul.cpp | 30 | 268 | 268 / 268 |
-| **Total** | | **89** | **597** | **597 / 597** |
+| **Total** | | **97** | **641** | **641 / 641** |
 
 ---
 

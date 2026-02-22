@@ -14,7 +14,8 @@ set -euo pipefail
 PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$PROJ_ROOT/build/sanitizers"
 INC="-I $PROJ_ROOT/include"
-SRCS="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/tests/test_tensor.cpp"
+SRCS_TENSOR="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/tests/test_tensor.cpp"
+SRCS_GRAPH="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT/tests/test_graph_loader.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -25,6 +26,7 @@ FAIL=0
 run_config() {
     local name="$1"
     local flags="$2"
+    local srcs="$3"
     local bin="$BUILD_DIR/test_${name}"
 
     echo ""
@@ -33,7 +35,7 @@ run_config() {
     echo "──────────────────────────────────────────────────────"
 
     # Build
-    g++ $CXXFLAGS $flags $INC $SRCS -o "$bin" 2>&1
+    g++ $CXXFLAGS $flags $INC $srcs -o "$bin" 2>&1
 
     # Run — capture output + exit code
     local out
@@ -60,14 +62,25 @@ echo "════════════════════════�
 echo "  TinyGNN — Sanitizer Test Suite"
 echo "══════════════════════════════════════════════════════════"
 
+# ── Tensor tests ──
 # 1. AddressSanitizer + LeakSanitizer
-run_config "asan_lsan" "-fsanitize=address -fsanitize=leak"
+run_config "tensor_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_TENSOR"
 
 # 2. UndefinedBehaviorSanitizer
-run_config "ubsan" "-fsanitize=undefined"
+run_config "tensor_ubsan" "-fsanitize=undefined" "$SRCS_TENSOR"
 
 # 3. Combined ASan + UBSan
-run_config "asan_ubsan" "-fsanitize=address,undefined"
+run_config "tensor_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_TENSOR"
+
+# ── GraphLoader tests ──
+# 4. AddressSanitizer + LeakSanitizer
+run_config "graph_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_GRAPH"
+
+# 5. UndefinedBehaviorSanitizer
+run_config "graph_ubsan" "-fsanitize=undefined" "$SRCS_GRAPH"
+
+# 6. Combined ASan + UBSan
+run_config "graph_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GRAPH"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

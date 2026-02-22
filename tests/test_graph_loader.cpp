@@ -4,12 +4,13 @@
 // ============================================================================
 //
 //  Test categories:
-//    1. Edge CSV parsing                   (tests  1 – 6)
+//    1. Edge CSV parsing                   (tests  1 –  6)
 //    2. Feature CSV parsing                (tests  7 – 12)
 //    3. Edge-list → sorted CSR conversion  (tests 13 – 20)
 //    4. Full pipeline (load)               (tests 21 – 24)
 //    5. Cora-scale validation              (tests 25 – 27)
-//    6. Error handling                     (tests 28 – 37)
+//    6. Reddit-scale validation            (tests 28 – 31)
+//    7. Error handling                     (tests 32 – 41)
 //
 // ============================================================================
 
@@ -22,6 +23,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <chrono>
 #include <random>
 #include <set>
 #include <sstream>
@@ -816,7 +818,407 @@ void test_cora_scale_node0_neighbors() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  6.  ERROR HANDLING
+//  6.  REDDIT-SCALE VALIDATION
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  Reddit (Hamilton et al. 2017, GraphSAGE paper):
+//    Nodes    : 232,965   (Reddit posts)
+//    Edges    : 114,615,892  (directed post-to-post links)
+//    Features : 602 per node
+//
+//  Data is generated synthetically with a fixed seed so the counts are exact
+//  and results are deterministic across runs.
+//
+//  Tests are split into two groups:
+//    a) In-memory algorithm test — calls edge_list_to_csr() directly,
+//       bypassing file I/O entirely.  Validates the CSR engine at full
+//       Reddit scale (peak RAM: ~1.8 GB).
+//
+//    b) Full file-pipeline tests — writes edge and feature CSV files using
+//       direct buffered I/O, then loads with GraphLoader::load().
+//       Reddit features use 602 binary values per node; the edge file
+//       contains all 114,615,892 directed edges.
+//       Expected runtime: 30–120 s depending on storage and CPU speed.
+//
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Buffered file helpers (needed for files too large for ostringstream) ─────
+
+namespace {
+
+/// Write the decimal representation of v into buf.
+static void append_int32(std::vector<char>& buf, int32_t v) {
+    char tmp[12];
+    int  len = std::snprintf(tmp, sizeof(tmp), "%d", v);
+    buf.insert(buf.end(), tmp, tmp + len);
+}
+
+/// Flush buf to f and clear it.
+static void flush_buf(std::ofstream& f, std::vector<char>& buf) {
+    f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+    buf.clear();
+}
+
+/// Write a directed edge CSV with exactly num_edges random (src,dst) pairs.
+/// Uses a 4 MB write buffer for speed.  Returns the temp-file path.
+static std::string write_edge_csv(std::size_t num_nodes,
+                                  std::size_t num_edges,
+                                  uint32_t    seed) {
+    static int counter = 0;
+    std::string path = "tinygnn_reddit_edges_" + std::to_string(counter++) + ".csv";
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("write_edge_csv: cannot create '" + path + "'");
+    }
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int32_t> nd(
+        0, static_cast<int32_t>(num_nodes - 1));
+
+    constexpr std::size_t BUF_CAP = 1u << 22;   // 4 MB
+    std::vector<char> buf;
+    buf.reserve(BUF_CAP);
+
+    // header
+    const char hdr[] = "src,dst\n";
+    buf.insert(buf.end(), hdr, hdr + sizeof(hdr) - 1);
+
+    for (std::size_t i = 0; i < num_edges; ++i) {
+        append_int32(buf, nd(rng));
+        buf.push_back(',');
+        append_int32(buf, nd(rng));
+        buf.push_back('\n');
+        if (buf.size() >= BUF_CAP) flush_buf(f, buf);
+    }
+    if (!buf.empty()) flush_buf(f, buf);
+    return path;
+}
+
+/// Write a feature CSV: nodes 0..num_nodes-1, num_features binary values each.
+/// Uses a 4 MB write buffer.  Returns the temp-file path.
+static std::string write_feature_csv(std::size_t num_nodes,
+                                     std::size_t num_features,
+                                     uint32_t    seed) {
+    static int counter = 0;
+    std::string path = "tinygnn_reddit_features_" + std::to_string(counter++) + ".csv";
+
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("write_feature_csv: cannot create '" + path + "'");
+    }
+
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> bit(0, 1);
+
+    constexpr std::size_t BUF_CAP = 1u << 22;   // 4 MB
+    std::vector<char> buf;
+    buf.reserve(BUF_CAP);
+
+    // header: "node_id,f0,f1,...,f{N-1}\n"
+    {
+        const char hdr_id[] = "node_id";
+        buf.insert(buf.end(), hdr_id, hdr_id + 7);
+        for (std::size_t j = 0; j < num_features; ++j) {
+            buf.push_back(',');
+            buf.push_back('f');
+            append_int32(buf, static_cast<int32_t>(j));
+        }
+        buf.push_back('\n');
+    }
+
+    for (std::size_t i = 0; i < num_nodes; ++i) {
+        append_int32(buf, static_cast<int32_t>(i));
+        for (std::size_t j = 0; j < num_features; ++j) {
+            buf.push_back(',');
+            buf.push_back(static_cast<char>('0' + bit(rng)));
+        }
+        buf.push_back('\n');
+        if (buf.size() >= BUF_CAP) flush_buf(f, buf);
+    }
+    if (!buf.empty()) flush_buf(f, buf);
+    return path;
+}
+
+/// RAII handle for one or two large temp files.
+struct LargeFiles {
+    std::string edges_path;
+    std::string features_path;
+
+    LargeFiles() = default;
+
+    ~LargeFiles() {
+        if (!edges_path.empty())    std::remove(edges_path.c_str());
+        if (!features_path.empty()) std::remove(features_path.c_str());
+    }
+
+    LargeFiles(const LargeFiles&)            = delete;
+    LargeFiles& operator=(const LargeFiles&) = delete;
+    LargeFiles(LargeFiles&&)                 = default;
+};
+
+}  // anonymous namespace
+
+// Reddit dataset constants
+constexpr std::size_t REDDIT_NODES    = 232965;
+constexpr std::size_t REDDIT_EDGES    = 114615892;
+constexpr std::size_t REDDIT_FEATURES = 602;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 28. Reddit-scale: in-memory CSR algorithm test (no file I/O)
+//     Directly calls edge_list_to_csr with 114,615,892 randomly generated
+//     (src, dst) pairs.  Validates nnz, row_ptr invariants, column bounds,
+//     and per-row sort order.
+//     Peak RAM: ~1.8 GB (edge vector 875 MB + CSR arrays ~917 MB).
+// ─────────────────────────────────────────────────────────────────────────────
+void test_reddit_scale_csr_algorithm() {
+    std::cout << "    [Reddit] Generating " << REDDIT_EDGES
+              << " edges in memory (peak RAM ~1.8 GB)...\n";
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::mt19937 rng(2026);
+    std::uniform_int_distribution<int32_t> nd(
+        0, static_cast<int32_t>(REDDIT_NODES - 1));
+
+    std::vector<std::pair<int32_t, int32_t>> edges;
+    edges.reserve(REDDIT_EDGES);
+    for (std::size_t i = 0; i < REDDIT_EDGES; ++i) {
+        edges.emplace_back(nd(rng), nd(rng));
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] Edge generation: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " ms\n";
+
+    auto adj = GraphLoader::edge_list_to_csr(edges, REDDIT_NODES);
+
+    auto t2 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] CSR construction: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+              << " ms\n";
+
+    // ── Shape ──────────────────────────────────────────────────────────────
+    ASSERT_EQ(adj.rows(), REDDIT_NODES);
+    ASSERT_EQ(adj.cols(), REDDIT_NODES);
+    ASSERT_EQ(adj.nnz(),  REDDIT_EDGES);
+    ASSERT_TRUE(adj.format() == StorageFormat::SparseCSR);
+
+    // ── row_ptr size and sentinels ──────────────────────────────────────────
+    ASSERT_EQ(adj.row_ptr().size(), REDDIT_NODES + 1);
+    ASSERT_EQ(adj.row_ptr().front(), 0);
+    ASSERT_EQ(adj.row_ptr().back(),  static_cast<int32_t>(REDDIT_EDGES));
+
+    // ── row_ptr non-decreasing ──────────────────────────────────────────────
+    bool non_dec = true;
+    for (std::size_t i = 1; i < adj.row_ptr().size(); ++i) {
+        if (adj.row_ptr()[i] < adj.row_ptr()[i - 1]) { non_dec = false; break; }
+    }
+    ASSERT_TRUE(non_dec);
+
+    // ── Column indices in bounds ────────────────────────────────────────────
+    bool cols_ok = true;
+    for (auto c : adj.col_ind()) {
+        if (c < 0 || static_cast<std::size_t>(c) >= REDDIT_NODES) {
+            cols_ok = false; break;
+        }
+    }
+    ASSERT_TRUE(cols_ok);
+
+    // ── Per-row sort invariant (sample every 1000th row to bound runtime) ───
+    const auto& rp = adj.row_ptr();
+    const auto& ci = adj.col_ind();
+    bool sorted_ok = true;
+    for (std::size_t r = 0; r < REDDIT_NODES; r += 1000) {
+        for (int32_t j = rp[r]; j + 1 < rp[r + 1]; ++j) {
+            if (ci[static_cast<std::size_t>(j)] >
+                ci[static_cast<std::size_t>(j + 1)]) {
+                sorted_ok = false;
+                break;
+            }
+        }
+        if (!sorted_ok) break;
+    }
+    ASSERT_TRUE(sorted_ok);
+
+    // ── Memory footprint ────────────────────────────────────────────────────
+    //  nnz × 4 (values) + nnz × 4 (col_ind) + (nodes+1) × 4 (row_ptr)
+    const std::size_t expected_bytes =
+        REDDIT_EDGES * sizeof(float) +
+        REDDIT_EDGES * sizeof(int32_t) +
+        (REDDIT_NODES + 1) * sizeof(int32_t);
+    ASSERT_EQ(adj.memory_footprint_bytes(), expected_bytes);
+
+    auto t3 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] CSR footprint: "
+              << adj.memory_footprint_bytes() / (1024 * 1024)
+              << " MB  |  total time: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count()
+              << " ms\n";
+    std::cout << "    [Reddit] Adjacency: " << adj.repr() << "\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 29. Reddit-scale: full file pipeline — counts and shape
+//     Writes edge CSV (114,615,892 rows) and feature CSV (232,965 × 602)
+//     to disk using buffered I/O, then loads via GraphLoader::load().
+//     Assert num_nodes == 232,965 and num_edges == 114,615,892.
+// ─────────────────────────────────────────────────────────────────────────────
+void test_reddit_scale_pipeline_counts() {
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::cout << "    [Reddit] Writing edge file (" << REDDIT_EDGES
+              << " rows)...\n";
+    LargeFiles files;
+    files.edges_path    = write_edge_csv(REDDIT_NODES, REDDIT_EDGES, /*seed=*/1337);
+
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] Edge file written: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count()
+              << " ms\n";
+
+    std::cout << "    [Reddit] Writing feature file ("
+              << REDDIT_NODES << " nodes x " << REDDIT_FEATURES << " features)...\n";
+    files.features_path = write_feature_csv(REDDIT_NODES, REDDIT_FEATURES, /*seed=*/42);
+
+    auto t2 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] Feature file written: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count()
+              << " ms\n";
+
+    std::cout << "    [Reddit] Loading via GraphLoader::load()...\n";
+    auto gd = GraphLoader::load(files.edges_path, files.features_path);
+
+    auto t3 = std::chrono::steady_clock::now();
+    std::cout << "    [Reddit] Load complete: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count()
+              << " ms  |  total: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t0).count()
+              << " ms\n";
+
+    // ── Counts ──────────────────────────────────────────────────────────────
+    ASSERT_EQ(gd.num_nodes,    REDDIT_NODES);
+    ASSERT_EQ(gd.num_edges,    REDDIT_EDGES);
+    ASSERT_EQ(gd.num_features, REDDIT_FEATURES);
+
+    // ── Adjacency shape ─────────────────────────────────────────────────────
+    ASSERT_EQ(gd.adjacency.rows(), REDDIT_NODES);
+    ASSERT_EQ(gd.adjacency.cols(), REDDIT_NODES);
+    ASSERT_EQ(gd.adjacency.nnz(),  REDDIT_EDGES);
+    ASSERT_TRUE(gd.adjacency.format() == StorageFormat::SparseCSR);
+
+    // ── Feature shape ────────────────────────────────────────────────────────
+    ASSERT_EQ(gd.node_features.rows(), REDDIT_NODES);
+    ASSERT_EQ(gd.node_features.cols(), REDDIT_FEATURES);
+    ASSERT_TRUE(gd.node_features.format() == StorageFormat::Dense);
+
+    std::cout << "    [Reddit] Adjacency: " << gd.adjacency.repr() << "\n";
+    std::cout << "    [Reddit] Features:  " << gd.node_features.repr() << "\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 30. Reddit-scale: CSR row_ptr invariants on the loaded full-pipeline graph
+// ─────────────────────────────────────────────────────────────────────────────
+void test_reddit_scale_csr_invariants() {
+    // Reuse the same edge/feature files (same seeds as test 29).
+    LargeFiles files;
+    files.edges_path    = write_edge_csv(REDDIT_NODES, REDDIT_EDGES, /*seed=*/1337);
+    files.features_path = write_feature_csv(REDDIT_NODES, REDDIT_FEATURES, /*seed=*/42);
+
+    std::cout << "    [Reddit] Loading graph for CSR invariant checks...\n";
+    auto gd = GraphLoader::load(files.edges_path, files.features_path);
+
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    // row_ptr has exactly num_nodes + 1 entries
+    ASSERT_EQ(rp.size(), REDDIT_NODES + 1);
+
+    // row_ptr sentinels
+    ASSERT_EQ(rp.front(), 0);
+    ASSERT_EQ(rp.back(),  static_cast<int32_t>(REDDIT_EDGES));
+
+    // row_ptr non-decreasing
+    bool non_dec = true;
+    for (std::size_t i = 1; i < rp.size(); ++i) {
+        if (rp[i] < rp[i - 1]) { non_dec = false; break; }
+    }
+    ASSERT_TRUE(non_dec);
+
+    // All column indices in [0, REDDIT_NODES)
+    bool cols_ok = true;
+    for (auto c : ci) {
+        if (c < 0 || static_cast<std::size_t>(c) >= REDDIT_NODES) {
+            cols_ok = false; break;
+        }
+    }
+    ASSERT_TRUE(cols_ok);
+
+    // Per-row sort invariant (sample every 1000th row)
+    bool sorted_ok = true;
+    for (std::size_t r = 0; r < REDDIT_NODES; r += 1000) {
+        for (int32_t j = rp[r]; j + 1 < rp[r + 1]; ++j) {
+            if (ci[static_cast<std::size_t>(j)] >
+                ci[static_cast<std::size_t>(j + 1)]) {
+                sorted_ok = false;
+                break;
+            }
+        }
+        if (!sorted_ok) break;
+    }
+    ASSERT_TRUE(sorted_ok);
+
+    std::cout << "    [Reddit] row_ptr[0]=" << rp.front()
+              << "  row_ptr[" << REDDIT_NODES << "]="
+              << rp.back() << "\n";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 31. Reddit-scale: Node 0 neighbors match raw CSV exactly
+//     Re-parses the edge file to build the ground truth for node 0, then
+//     traverses row 0 of the CSR and asserts an exact match.
+// ─────────────────────────────────────────────────────────────────────────────
+void test_reddit_scale_node0_neighbors() {
+    // Write edges with the same seed as test 29 so results are identical.
+    LargeFiles files;
+    files.edges_path    = write_edge_csv(REDDIT_NODES, REDDIT_EDGES, /*seed=*/1337);
+    files.features_path = write_feature_csv(REDDIT_NODES, REDDIT_FEATURES, /*seed=*/42);
+
+    std::cout << "    [Reddit] Parsing edges for ground-truth node-0 neighbors...\n";
+    auto raw = GraphLoader::parse_edges(files.edges_path);
+
+    std::vector<int32_t> expected;
+    for (const auto& [src, dst] : raw) {
+        if (src == 0) expected.push_back(dst);
+    }
+    std::sort(expected.begin(), expected.end());
+
+    std::cout << "    [Reddit] Loading full graph...\n";
+    auto gd = GraphLoader::load(files.edges_path, files.features_path);
+
+    const auto& rp = gd.adjacency.row_ptr();
+    const auto& ci = gd.adjacency.col_ind();
+
+    std::vector<int32_t> actual;
+    actual.reserve(static_cast<std::size_t>(rp[1] - rp[0]));
+    for (int32_t j = rp[0]; j < rp[1]; ++j) {
+        actual.push_back(ci[static_cast<std::size_t>(j)]);
+    }
+
+    ASSERT_EQ(actual.size(), expected.size());
+    bool match = true;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        if (actual[i] != expected[i]) { match = false; break; }
+    }
+    ASSERT_TRUE(match);
+
+    std::cout << "    [Reddit] Node 0 has " << actual.size()
+              << " neighbors — CSR traversal matches raw CSV exactly\n";
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  7.  ERROR HANDLING
 // ════════════════════════════════════════════════════════════════════════════
 
 // 28. File not found
@@ -960,6 +1362,14 @@ int main() {
     RUN_TEST(test_cora_scale_counts);
     RUN_TEST(test_cora_scale_csr_invariants);
     RUN_TEST(test_cora_scale_node0_neighbors);
+
+    std::cout << "\n-- Reddit-Scale Validation --------------\n";
+    std::cout << "  NOTE: Reddit tests are large (114M edges, ~1.8 GB peak RAM).\n";
+    std::cout << "  Expected runtime: 30-120 s depending on hardware.\n";
+    RUN_TEST(test_reddit_scale_csr_algorithm);
+    RUN_TEST(test_reddit_scale_pipeline_counts);
+    RUN_TEST(test_reddit_scale_csr_invariants);
+    RUN_TEST(test_reddit_scale_node0_neighbors);
 
     std::cout << "\n-- Error Handling -----------------------\n";
     RUN_TEST(test_error_file_not_found);

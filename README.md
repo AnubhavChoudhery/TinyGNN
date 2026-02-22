@@ -202,7 +202,34 @@ Adjacency: Tensor(2708x2708, SparseCSR, 95,284 bytes)
 Features:  Tensor(2708x1433, Dense, 15,522,256 bytes)
 ```
 
-### Test suite -- 196 assertions, 37 test functions, 0 failures
+### Results (Reddit-scale synthetic benchmark)
+
+Reddit (Hamilton et al. 2017, GraphSAGE paper): 232,965 nodes, 114,615,892 directed edges, 602 features.
+Generated synthetically with a fixed seed; full file pipeline writes ~1.4 GB edge CSV + ~282 MB feature CSV.
+
+```
+Nodes:     232,965
+Edges:     114,615,892
+Features:  602 per node
+
+Adjacency: Tensor(232965x232965, SparseCSR, 917,859,000 bytes)  (~875 MB)
+Features:  Tensor(232965x602,   Dense,      560,979,720 bytes)  (~535 MB)
+
+In-memory CSR algorithm test:
+  Edge generation (114M pairs):   1,350 ms
+  CSR construction + sort:        5,591 ms
+  Total:                          6,979 ms
+
+Full file-pipeline test:
+  Edge file write (1.4 GB):      25,491 ms
+  Feature file write (282 MB):    3,748 ms
+  GraphLoader::load():          119,047 ms
+  Total:                        148,286 ms
+
+Node 0 neighbors: 455 (CSR traversal matches raw CSV exactly)
+```
+
+### Test suite -- 225 assertions, 41 test functions, 0 failures
 
 | Category | Functions | Covers |
 |----------|-----------|--------|
@@ -211,11 +238,12 @@ Features:  Tensor(2708x1433, Dense, 15,522,256 bytes)
 | CSR conversion | 8 | exact arrays, sort invariant, empty rows, memory footprint |
 | Full load pipeline | 4 | node-0 neighbors, all-nodes verify, feature zero-expansion |
 | Cora-scale validation | 3 | 2708 nodes / 10556 edges / 1433 features / row_ptr invariants |
+| Reddit-scale validation | 4 | 232,965 nodes / 114,615,892 edges / in-memory CSR + full pipeline + node-0 match |
 | Error handling | 10 | file-not-found, malformed lines, negative IDs, out-of-range |
 
 ```
-Total : 196
-Passed: 196
+Total : 225
+Passed: 225
 Failed: 0
 ```
 
@@ -318,9 +346,9 @@ Failed: 0
 | Phase | Test file | Functions | Assertions | Result |
 |-------|-----------|-----------|------------|--------|
 | 1 | test_tensor.cpp | 18 | 104 | 104 / 104 |
-| 2 | test_graph_loader.cpp | 37 | 196 | 196 / 196 |
+| 2 | test_graph_loader.cpp | 41 | 225 | 225 / 225 |
 | 3 | test_matmul.cpp | 30 | 268 | 268 / 268 |
-| **Total** | | **85** | **568** | **568 / 568** |
+| **Total** | | **89** | **597** | **597 / 597** |
 
 ---
 

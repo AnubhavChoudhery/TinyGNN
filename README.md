@@ -13,7 +13,8 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 1 | Hybrid Tensor Core | Complete |
 | 2 | Graph Data Loader | Complete |
 | 3 | Dense Compute Kernels (GEMM) | Complete |
-| 4 | Parallel Execution Engine | Planned |
+| 4 | Sparse Compute Kernels (SpMM) | Complete |
+| 5 | Parallel Execution Engine | Planned |
 
 ---
 
@@ -26,23 +27,24 @@ TinyGNN/
 │   └── tinygnn/
 │       ├── tensor.hpp          # StorageFormat enum + Tensor struct
 │       ├── graph_loader.hpp    # GraphData + GraphLoader (CSV -> CSR pipeline)
-│       └── ops.hpp             # compute kernels: matmul (dense GEMM)
+│       └── ops.hpp             # compute kernels: matmul (GEMM) + spmm (SpMM)
 ├── src/
 │   ├── tensor.cpp
 │   ├── graph_loader.cpp        # CSV parser + edge-list-to-CSR conversion
-│   └── ops.cpp                 # matmul implementation (i,k,j loop order)
+│   └── ops.cpp                 # matmul (GEMM) + spmm (CSR-SpMM) implementations
 ├── tests/
 │   ├── test_tensor.cpp         # Phase 1 -- 104 assertions
 │   ├── test_graph_loader.cpp   # Phase 2 -- 269 assertions
-│   └── test_matmul.cpp         # Phase 3 -- 268 assertions
+│   ├── test_matmul.cpp         # Phase 3 -- 268 assertions
+│   └── test_spmm.cpp           # Phase 4 -- 306 assertions
 ├── datasets/                   # downloaded via scripts/fetch_datasets.py
 │   ├── cora/                   # 2,708 nodes, 5,429 edges, 1,433 features
 │   └── reddit/                 # 232,965 nodes, 114,615,892 edges, 602 features
 └── scripts/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
     ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
-    ├── sanitizers.sh           # ASan + UBSan (9 configs, all 3 phases)
-    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 3 phases)
+    ├── sanitizers.sh           # ASan + UBSan (12 configs, all 4 phases)
+    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 4 phases)
 ```
 
 ---
@@ -76,11 +78,16 @@ g++ -std=c++17 -Wall -Wextra -I include \
 g++ -std=c++17 -Wall -Wextra -I include \
     src/tensor.cpp src/ops.cpp tests/test_matmul.cpp \
     -o build/test_matmul && ./build/test_matmul
+
+# Phase 4 -- Sparse-Dense SpMM
+g++ -std=c++17 -Wall -Wextra -I include \
+    src/tensor.cpp src/ops.cpp tests/test_spmm.cpp \
+    -o build/test_spmm && ./build/test_spmm
 ```
 
 ### Memory safety (WSL / Linux)
 ```bash
-bash scripts/sanitizers.sh       # 9 sanitizer configs across all phases
+bash scripts/sanitizers.sh       # 12 sanitizer configs across all phases
 bash scripts/valgrind_all.sh     # Memcheck + Helgrind + Callgrind
 ```
 
@@ -402,6 +409,109 @@ Failed: 0
 
 ---
 
+## Phase 4 -- Sparse Compute Kernels (SpMM)
+
+### Goal
+Implement the sparse-dense matrix multiplication kernel that is the heart of GNN message-passing: `H_agg = Adj × H`, aggregating each node's neighbor features via the sparse adjacency matrix.
+
+### Design
+
+#### spmm function
+```cpp
+// C = A × B
+// A: SparseCSR (M × K)   B: Dense (K × N)   C: Dense (M × N), newly allocated
+Tensor spmm(const Tensor& A, const Tensor& B);
+```
+
+#### Algorithm -- CSR-SpMM
+
+```
+for i in [0, M):                        // row of A (node)
+  for nz in [row_ptr[i], row_ptr[i+1]): // non-zeros in row i (neighbors)
+    k = col_ind[nz]                     // column (neighbor node ID)
+    a_val = data[nz]                    // edge weight (1.0 for unweighted)
+    for j in [0, N):                    // feature dimension
+      C[i][j] += a_val * B[k][j]       // accumulate neighbor's features
+```
+
+**Why CSR-SpMM:** The outer loop walks rows (nodes). The middle loop walks non-zero columns (graph neighbors) — this *is* the message-passing. The inner loop accumulates dense features — cache-friendly because `B[k][j]` is contiguous in memory and the compiler can auto-vectorise with the scalar `a_val` hoisted to a register.
+
+#### Complexity
+
+| Metric | Value |
+|--------|-------|
+| Time complexity | O(nnz × N) — proportional to edges × features |
+| FLOPs | 2 × nnz × N (1 multiply + 1 add per edge per feature) |
+| Output allocation | M × N × 4 bytes |
+
+#### Preconditions enforced
+- A must be StorageFormat::SparseCSR (Dense A → "use matmul() instead")
+- B must be StorageFormat::Dense (Sparse B → "Sparse × Sparse not supported")
+- A.cols() must equal B.rows() — throws std::invalid_argument with dimensions in message
+- Early exit for degenerate cases (M=0, N=0, or nnz=0) producing valid zero-filled output
+
+### Results
+
+3×3 hand-calculated SpMM (spec required):
+```
+A (SparseCSR):                   B (Dense):
+  [1 1 0]  row_ptr=[0,2,3,5]      [1 2]
+  [0 1 0]  col_ind=[0,1,1,0,2]    [3 4]
+  [1 0 1]  values =[1,1,1,1,1]    [5 6]
+
+C = spmm(A, B):
+  [4, 6]   ← 1·[1,2] + 1·[3,4]
+  [3, 4]   ← 1·[3,4]
+  [6, 8]   ← 1·[1,2] + 1·[5,6]
+```
+
+4×4 weighted hand-calculated:
+```
+A (SparseCSR):                B (Dense):
+  [2 0 0 0]  values=[2,3,     [1  0  2]
+  [0 3 1 0]   1,1,2,1,1]      [0  1  0]
+  [1 0 0 2]                    [3  0  1]
+  [0 1 1 0]                    [0  2  0]
+
+C = spmm(A, B):
+  [2, 0, 4]  [3, 3, 1]  [1, 4, 2]  [3, 1, 1]
+```
+
+GNN message-passing (star graph, 5 nodes):
+```
+H_agg = spmm(Adj_star, H)
+  Hub (node 0): sum of all features = [10, 40]
+  Leaf i:       H[0] + H[i]  (receives from hub + self)
+```
+
+Equivalence with dense matmul verified for:
+- 32×32 sparse (~9% density) × 32×16 dense
+- Cora-scale: 2,708×2,708 sparse (3 nnz/row) × 2,708×32 dense
+
+### Test suite -- 306 assertions, 35 test functions, 0 failures
+
+| Category | Functions | Covers |
+|----------|-----------|--------|
+| 3×3 hand-calculated (spec) | 3 | full matrix, element checks, column vector |
+| 4×4 weighted CSR | 2 | full result, element derivations |
+| Non-square shapes | 3 | (5×3)×(3×4), (2×5)×(5×1), (1×4)×(4×3) |
+| Identity & zero properties | 4 | sparse I × B = B, 64×64, zero-nnz, all-ones |
+| GNN message-passing | 3 | triangle (fully connected), star graph, two-hop path chain |
+| Dense matmul equivalence | 2 | small 3×3, medium 32×32 deterministic sparse |
+| Output tensor properties | 3 | format=Dense, shape M×N, memory footprint |
+| Stress / scale | 3 | 512×512 identity, 2708-node Cora-scale, 1024×128 |
+| Wrong format errors | 4 | dense A throws, message check, sparse B throws, message check |
+| Dimension mismatch | 3 | basic throw, message "dimension mismatch", multiple combos |
+| Edge / degenerate cases | 5 | single nnz, empty rows, diagonal/self-loops, negative weights, 1×1 |
+
+```
+Total : 306
+Passed: 306
+Failed: 0
+```
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -409,21 +519,22 @@ Failed: 0
 | 1 | test_tensor.cpp | 18 | 104 | 104 / 104 |
 | 2 | test_graph_loader.cpp | 49 | 269 | 269 / 269 |
 | 3 | test_matmul.cpp | 30 | 268 | 268 / 268 |
-| **Total** | | **97** | **641** | **641 / 641** |
+| 4 | test_spmm.cpp | 35 | 306 | 306 / 306 |
+| **Total** | | **132** | **947** | **947 / 947** |
 
 ---
 
 ## Memory Safety
 
-All three phases pass the full sanitizer matrix with zero errors:
+All four phases pass the full sanitizer matrix with zero errors:
 
-| Config | Tensor | Graph Loader | Matmul |
-|--------|--------|--------------|--------|
-| ASan + LSan | Pass | Pass | Pass |
-| UBSan | Pass | Pass | Pass |
-| ASan + UBSan combined | Pass | Pass | Pass |
-| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
-| Valgrind Helgrind | 0 races | 0 races | 0 races |
+| Config | Tensor | Graph Loader | Matmul | SpMM |
+|--------|--------|--------------|--------|------|
+| ASan + LSan | Pass | Pass | Pass | Pass |
+| UBSan | Pass | Pass | Pass | Pass |
+| ASan + UBSan combined | Pass | Pass | Pass | Pass |
+| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
+| Valgrind Helgrind | 0 races | 0 races | 0 races | 0 races |
 
 ---
 
@@ -434,3 +545,4 @@ All three phases pass the full sanitizer matrix with zero errors:
 - **Fail-fast validation** -- CSR construction validates row_ptr monotonicity, column index bounds, and size consistency; matmul validates format and inner dimensions before allocating output
 - **Unified interface** -- Dense and SparseCSR tensors share the same Tensor type; format is a runtime tag, not a separate class hierarchy
 - **Cache-aware loop ordering** -- GEMM uses (i,k,j) order with a register-hoisted scalar to enable compiler auto-vectorisation on the inner loop
+- **Sparse-native message passing** -- SpMM walks the CSR structure directly (row_ptr → col_ind → accumulate), avoiding any sparse-to-dense conversion

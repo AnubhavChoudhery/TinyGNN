@@ -14,7 +14,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 2 | Graph Data Loader | Complete |
 | 3 | Dense Compute Kernels (GEMM) | Complete |
 | 4 | Sparse Compute Kernels (SpMM) | Complete |
-| 5 | Parallel Execution Engine | Planned |
+| 5 | Activations & Utilities | Complete |
 
 ---
 
@@ -27,24 +27,25 @@ TinyGNN/
 │   └── tinygnn/
 │       ├── tensor.hpp          # StorageFormat enum + Tensor struct
 │       ├── graph_loader.hpp    # GraphData + GraphLoader (CSV -> CSR pipeline)
-│       └── ops.hpp             # compute kernels: matmul (GEMM) + spmm (SpMM)
+│       └── ops.hpp             # compute kernels + activations: matmul, spmm, relu, softmax, etc.
 ├── src/
 │   ├── tensor.cpp
 │   ├── graph_loader.cpp        # CSV parser + edge-list-to-CSR conversion
-│   └── ops.cpp                 # matmul (GEMM) + spmm (CSR-SpMM) implementations
+│   └── ops.cpp                 # matmul, spmm, relu, leaky_relu, elu, sigmoid, tanh, gelu, softmax, log_softmax, add_bias
 ├── tests/
 │   ├── test_tensor.cpp         # Phase 1 -- 104 assertions
 │   ├── test_graph_loader.cpp   # Phase 2 -- 269 assertions
 │   ├── test_matmul.cpp         # Phase 3 -- 268 assertions
-│   └── test_spmm.cpp           # Phase 4 -- 306 assertions
+│   ├── test_spmm.cpp           # Phase 4 -- 306 assertions
+│   └── test_activations.cpp    # Phase 5 -- 266 assertions
 ├── datasets/                   # downloaded via scripts/fetch_datasets.py
 │   ├── cora/                   # 2,708 nodes, 5,429 edges, 1,433 features
 │   └── reddit/                 # 232,965 nodes, 114,615,892 edges, 602 features
 └── scripts/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
     ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
-    ├── sanitizers.sh           # ASan + UBSan (12 configs, all 4 phases)
-    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 4 phases)
+    ├── sanitizers.sh           # ASan + UBSan (15 configs, all 5 phases)
+    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 5 phases)
 ```
 
 ---
@@ -83,11 +84,16 @@ g++ -std=c++17 -Wall -Wextra -I include \
 g++ -std=c++17 -Wall -Wextra -I include \
     src/tensor.cpp src/ops.cpp tests/test_spmm.cpp \
     -o build/test_spmm && ./build/test_spmm
+
+# Phase 5 -- Activations & Utilities
+g++ -std=c++17 -Wall -Wextra -I include \
+    src/tensor.cpp src/ops.cpp tests/test_activations.cpp \
+    -o build/test_activations && ./build/test_activations
 ```
 
 ### Memory safety (WSL / Linux)
 ```bash
-bash scripts/sanitizers.sh       # 12 sanitizer configs across all phases
+bash scripts/sanitizers.sh       # 15 sanitizer configs across all phases
 bash scripts/valgrind_all.sh     # Memcheck + Helgrind + Callgrind
 ```
 
@@ -512,6 +518,104 @@ Failed: 0
 
 ---
 
+## Phase 5 -- Activations & Utilities
+
+### Goal
+Implement the element-wise activation functions and utilities needed between GNN layers: `H' = Activation(Adj × H × W + b)`.  These operate in-place on Dense tensors for zero-copy efficiency.
+
+### Design
+
+#### Activation functions
+
+| Function | Formula | GNN Use Case |
+|----------|---------|--------------|
+| `relu_inplace(X)` | max(0, x) | GCN, GraphSAGE, GIN — standard hidden layer activation |
+| `leaky_relu_inplace(X, α)` | x if x≥0, else αx (default α=0.01) | GAT attention coefficients (α=0.2) |
+| `elu_inplace(X, α)` | x if x≥0, else α(eˣ−1) (default α=1.0) | EGNN, PNA — smooth negative region |
+| `sigmoid_inplace(X)` | 1/(1+e⁻ˣ) | GGNN gating, link prediction, binary classification |
+| `tanh_inplace(X)` | tanh(x) | GRU/LSTM graph networks (GGNN, MPNN) |
+| `gelu_inplace(X)` | x·Φ(x) ≈ 0.5x(1+tanh(√(2/π)(x+0.044715x³))) | GPS, Graphormer, TokenGT — transformer GNNs |
+| `softmax_inplace(X)` | row-wise softmax with max-subtraction stability | GAT attention normalization, classification output |
+| `log_softmax_inplace(X)` | row-wise log-softmax (numerically stable) | NLL loss for node classification |
+
+#### Utility functions
+
+| Function | Operation | GNN Use Case |
+|----------|-----------|--------------|
+| `add_bias(X, bias)` | X[i][j] += bias[0][j] — broadcast (1×N) across M rows | Linear layer bias: H' = AHW + b |
+
+#### Common properties
+- All activations modify the tensor **in-place** (O(1) extra memory)
+- All validate **Dense format** and throw `std::invalid_argument` on SparseCSR
+- Softmax / log-softmax use the **max-subtraction trick** for numerical stability
+- Sigmoid uses a **two-branch implementation** (x≥0 vs x<0) to prevent overflow
+- GELU uses the **tanh approximation** (same as PyTorch `F.gelu(approximate='tanh')`)
+
+#### Complexity
+
+| Function | Time | Extra Memory |
+|----------|------|-------------|
+| relu, leaky_relu, sigmoid, tanh | O(M × N) | O(1) |
+| elu, gelu | O(M × N) with exp/tanh on subset | O(1) |
+| softmax, log_softmax | O(M × N) — 3 passes per row | O(1) |
+| add_bias | O(M × N) | O(1) |
+
+### Results
+
+GCN layer pipeline (identity Adj, 3 nodes, 2 features):
+```
+H' = ReLU(Adj × H × W + b)
+  Node 0: [1.5, 0.0]   (relu clamps negative bias-shifted value)
+  Node 1: [2.5, 0.0]
+  Node 2: [3.5, 0.0]
+```
+
+GAT-style attention (LeakyReLU + Softmax):
+```
+Scores:  [0.5, -0.3, 1.2]
+LeakyReLU(α=0.2): [0.5, -0.06, 1.2]
+Softmax: attention weights sum to 1.0, largest score gets most weight
+```
+
+Node classification (Log-Softmax for NLL loss):
+```
+3 nodes × 4 classes
+All log-probabilities ≤ 0, exp(row) sums to 1.0
+Argmax preserved through log-softmax
+```
+
+Numerical stability verified:
+```
+softmax([1000, 1001])     — no NaN/Inf, correct probabilities
+log_softmax([1000, 1001, 999]) — no NaN/Inf, exp sums to 1.0
+```
+
+### Test suite -- 266 assertions, 70 test functions, 0 failures
+
+| Category | Functions | Covers |
+|----------|-----------|--------|
+| ReLU | 5 | basic, 2D matrix, all-positive, all-negative, zero preservation |
+| Leaky ReLU | 5 | default α=0.01, GAT α=0.2, 2D, α=0→ReLU, α=1→identity |
+| ELU | 4 | basic, custom α=2.0, saturation at −α, 2D mixed signs |
+| Sigmoid | 5 | basic values, σ(x)+σ(−x)=1 symmetry, bounds (0,1), hand-calculated, 2D |
+| Tanh | 5 | basic, odd symmetry, bounds (−1,1), hand-calculated, 2D |
+| GELU | 4 | basic (0→0, large→x, neg→0), hand-calculated vs reference, zero symmetry, 2D |
+| Softmax | 7 | row sums=1, bounds [0,1], uniform dist, hand-calculated, multi-row, numerical stability, argmax preserved |
+| Log-Softmax | 6 | exp sums=1, all ≤ 0, consistent with softmax, uniform, numerical stability, multi-row |
+| Add bias | 6 | basic broadcasting, zero bias, negative bias, single-row, wrong-rows throw, wrong-cols throw |
+| GNN pipeline integration | 3 | full GCN layer, GAT attention, node classification |
+| Error handling (SparseCSR) | 10 | all 9 activations + add_bias reject sparse input |
+| Stress / scale | 5 | relu 1024×256, softmax 1024×128, sigmoid 512×512, bias 2708×32, gelu 256×256 |
+| Edge / degenerate | 5 | 1×1 through all activations, zero-cols rejected, zero-rows no-op, double-apply idempotency |
+
+```
+Total : 266
+Passed: 266
+Failed: 0
+```
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -520,21 +624,22 @@ Failed: 0
 | 2 | test_graph_loader.cpp | 49 | 269 | 269 / 269 |
 | 3 | test_matmul.cpp | 30 | 268 | 268 / 268 |
 | 4 | test_spmm.cpp | 35 | 306 | 306 / 306 |
-| **Total** | | **132** | **947** | **947 / 947** |
+| 5 | test_activations.cpp | 70 | 266 | 266 / 266 |
+| **Total** | | **202** | **1,213** | **1,213 / 1,213** |
 
 ---
 
 ## Memory Safety
 
-All four phases pass the full sanitizer matrix with zero errors:
+All five phases pass the full sanitizer matrix with zero errors:
 
-| Config | Tensor | Graph Loader | Matmul | SpMM |
-|--------|--------|--------------|--------|------|
-| ASan + LSan | Pass | Pass | Pass | Pass |
-| UBSan | Pass | Pass | Pass | Pass |
-| ASan + UBSan combined | Pass | Pass | Pass | Pass |
-| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
-| Valgrind Helgrind | 0 races | 0 races | 0 races | 0 races |
+| Config | Tensor | Graph Loader | Matmul | SpMM | Activations |
+|--------|--------|--------------|--------|------|-------------|
+| ASan + LSan | Pass | Pass | Pass | Pass | Pass |
+| UBSan | Pass | Pass | Pass | Pass | Pass |
+| ASan + UBSan combined | Pass | Pass | Pass | Pass | Pass |
+| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
+| Valgrind Helgrind | 0 races | 0 races | 0 races | 0 races | 0 races |
 
 ---
 
@@ -546,3 +651,5 @@ All four phases pass the full sanitizer matrix with zero errors:
 - **Unified interface** -- Dense and SparseCSR tensors share the same Tensor type; format is a runtime tag, not a separate class hierarchy
 - **Cache-aware loop ordering** -- GEMM uses (i,k,j) order with a register-hoisted scalar to enable compiler auto-vectorisation on the inner loop
 - **Sparse-native message passing** -- SpMM walks the CSR structure directly (row_ptr → col_ind → accumulate), avoiding any sparse-to-dense conversion
+- **In-place activations** -- all 8 activation functions modify tensors in-place with O(1) extra memory, avoiding unnecessary allocations in GNN inference pipelines
+- **Numerical stability** -- softmax/log-softmax use the max-subtraction trick; sigmoid uses a two-branch formula to prevent overflow for extreme inputs

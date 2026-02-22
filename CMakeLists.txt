@@ -46,3 +46,7 @@ add_test(NAME MatmulTests COMMAND test_matmul)
 add_executable(test_spmm tests/test_spmm.cpp)
 target_link_libraries(test_spmm PRIVATE tinygnn_core)
 add_test(NAME SpmmTests COMMAND test_spmm)
+
+add_executable(test_activations tests/test_activations.cpp)
+target_link_libraries(test_activations PRIVATE tinygnn_core)
+add_test(NAME ActivationsTests COMMAND test_activations)

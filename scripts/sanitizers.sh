@@ -16,6 +16,7 @@ BUILD_DIR="$PROJ_ROOT/build/sanitizers"
 INC="-I $PROJ_ROOT/include"
 SRCS_TENSOR="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/tests/test_tensor.cpp"
 SRCS_GRAPH="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT/tests/test_graph_loader.cpp"
+SRCS_MATMUL="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_matmul.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -81,6 +82,16 @@ run_config "graph_ubsan" "-fsanitize=undefined" "$SRCS_GRAPH"
 
 # 6. Combined ASan + UBSan
 run_config "graph_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GRAPH"
+
+# ── Matmul (GEMM) tests ──
+# 7. AddressSanitizer + LeakSanitizer
+run_config "matmul_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_MATMUL"
+
+# 8. UndefinedBehaviorSanitizer
+run_config "matmul_ubsan" "-fsanitize=undefined" "$SRCS_MATMUL"
+
+# 9. Combined ASan + UBSan
+run_config "matmul_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_MATMUL"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

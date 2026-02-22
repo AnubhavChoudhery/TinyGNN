@@ -1,10 +1,12 @@
 // ============================================================================
-//  TinyGNN — Compute Kernels  (Phase 3 + Phase 4)
+//  TinyGNN — Compute Kernels & Activations  (Phase 3 + Phase 4 + Phase 5)
 //  src/ops.cpp
 // ============================================================================
 
 #include "tinygnn/ops.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -220,6 +222,343 @@ Tensor spmm(const Tensor& A, const Tensor& B) {
     }
 
     return C;
+}
+
+// ============================================================================
+//                  Phase 5 — Activations & Utilities
+// ============================================================================
+
+// ── Helper: validate that a tensor is Dense ─────────────────────────────────
+static void require_dense(const Tensor& X, const char* func_name) {
+    if (X.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            std::string(func_name) +
+            ": tensor must be Dense (got SparseCSR). "
+            "Activations operate on dense feature matrices only.");
+    }
+}
+
+// ============================================================================
+//  relu_inplace  — f(x) = max(0, x)
+// ============================================================================
+//
+//  Single pass over all elements.  Branchless on most compilers: the
+//  ternary compiles to a conditional move (cmov) or max instruction.
+//
+//  Used in virtually every GNN architecture:
+//    GCN:        H' = ReLU(  D^{-½} A D^{-½} H W  )
+//    GraphSAGE:  H' = ReLU(  W · CONCAT(h_v, AGG({h_u}))  )
+//    GIN:        H' = ReLU(  MLP( (1+ε) h_v + Σ h_u )  )
+//
+// ============================================================================
+void relu_inplace(Tensor& X) {
+    require_dense(X, "relu_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (d[i] < 0.0f) d[i] = 0.0f;
+    }
+}
+
+// ============================================================================
+//  leaky_relu_inplace  — f(x) = x if x >= 0, else alpha * x
+// ============================================================================
+//
+//  The default alpha=0.01 is the standard LeakyReLU.
+//  GAT (Veličković et al. 2018) uses alpha=0.2 for attention coefficients.
+//
+//  Unlike ReLU, Leaky ReLU allows a small gradient for negative inputs,
+//  preventing "dead neuron" problems in deep GNN stacks.
+//
+// ============================================================================
+void leaky_relu_inplace(Tensor& X, float alpha) {
+    require_dense(X, "leaky_relu_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (d[i] < 0.0f) d[i] *= alpha;
+    }
+}
+
+// ============================================================================
+//  elu_inplace  — f(x) = x if x >= 0, else alpha * (exp(x) - 1)
+// ============================================================================
+//
+//  ELU (Clevert et al. 2016) provides:
+//    • Smooth transition through zero (continuous first derivative)
+//    • Negative saturation at -alpha (pushes mean activations toward zero)
+//    • No "dying neuron" problem
+//
+//  Used in EGNN (equivariant GNNs), PNA, and some message-passing designs.
+//  exp() is only computed for negative elements (positive elements are cheap).
+//
+// ============================================================================
+void elu_inplace(Tensor& X, float alpha) {
+    require_dense(X, "elu_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (d[i] < 0.0f) {
+            d[i] = alpha * (std::exp(d[i]) - 1.0f);
+        }
+    }
+}
+
+// ============================================================================
+//  sigmoid_inplace  — f(x) = 1 / (1 + exp(-x))
+// ============================================================================
+//
+//  Numerically stable implementation:
+//    x >= 0:  f(x) = 1 / (1 + exp(-x))           — standard form
+//    x <  0:  f(x) = exp(x) / (1 + exp(x))        — avoids exp(large positive)
+//
+//  Both branches produce identical mathematical results but the split
+//  prevents float overflow for extreme values.
+//
+//  GNN usage:
+//    • GGNN gate:  z_v = σ(W_z h_v + U_z m_v)
+//    • Link prediction:  P(edge) = σ(h_u · h_v)
+//    • Binary node classification output
+//
+// ============================================================================
+void sigmoid_inplace(Tensor& X) {
+    require_dense(X, "sigmoid_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        if (d[i] >= 0.0f) {
+            d[i] = 1.0f / (1.0f + std::exp(-d[i]));
+        } else {
+            const float ex = std::exp(d[i]);
+            d[i] = ex / (1.0f + ex);
+        }
+    }
+}
+
+// ============================================================================
+//  tanh_inplace  — f(x) = tanh(x)
+// ============================================================================
+//
+//  Uses std::tanh which is already numerically stable for all float inputs.
+//  Output range: (-1, 1).
+//
+//  GNN usage:
+//    • GGNN (Li et al. 2016): GRU cell state update
+//    • MPNN (Gilmer et al. 2017): message function
+//    • Some attention score clamping mechanisms
+//
+// ============================================================================
+void tanh_inplace(Tensor& X) {
+    require_dense(X, "tanh_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    for (std::size_t i = 0; i < n; ++i) {
+        d[i] = std::tanh(d[i]);
+    }
+}
+
+// ============================================================================
+//  gelu_inplace  — f(x) = x * Φ(x)  (tanh approximation)
+// ============================================================================
+//
+//  Approximation (Hendrycks & Gimpel 2016):
+//    f(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+//
+//  This is the same approximation used by PyTorch's F.gelu(approximate='tanh')
+//  and is the standard in transformer-based GNNs.
+//
+//  GNN usage:
+//    • GPS (Rampášek et al. 2022): feed-forward layers
+//    • Graphormer (Ying et al. 2021): transformer FFN blocks
+//    • TokenGT (Kim et al. 2022): all MLP layers
+//
+// ============================================================================
+void gelu_inplace(Tensor& X) {
+    require_dense(X, "gelu_inplace");
+
+    float* __restrict__ d = X.data().data();
+    const std::size_t n = X.data().size();
+
+    // sqrt(2/π) ≈ 0.7978845608
+    constexpr float SQRT_2_OVER_PI = 0.7978845608f;
+    constexpr float COEFF          = 0.044715f;
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const float x = d[i];
+        const float inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
+        d[i] = 0.5f * x * (1.0f + std::tanh(inner));
+    }
+}
+
+// ============================================================================
+//  softmax_inplace  — row-wise softmax  (numerically stable)
+// ============================================================================
+//
+//  For each row i of X (M × N):
+//    1. Find max_val = max_j X[i][j]           (prevent overflow)
+//    2. Compute exp(X[i][j] - max_val)         (shifted exponentials)
+//    3. Sum the exponentials → row_sum
+//    4. Divide each element by row_sum          (normalize to probability)
+//
+//  3 passes per row: find max, compute exp+sum, divide.
+//
+//  GNN usage:
+//    • GAT:    α_ij = softmax_j(LeakyReLU(a^T [W h_i || W h_j]))
+//    • Multi-class node classification output (C classes → C-dim softmax)
+//
+//  Zero-row tensors (M=0) are valid no-ops.  Zero-column tensors are
+//  rejected because softmax over an empty set is undefined.
+//
+// ============================================================================
+void softmax_inplace(Tensor& X) {
+    require_dense(X, "softmax_inplace");
+
+    const std::size_t M = X.rows();
+    const std::size_t N = X.cols();
+
+    if (N == 0) {
+        throw std::invalid_argument(
+            "softmax_inplace: tensor has 0 columns — softmax over "
+            "an empty set is undefined.");
+    }
+
+    if (M == 0) return;  // no rows → nothing to do
+
+    float* __restrict__ d = X.data().data();
+
+    for (std::size_t i = 0; i < M; ++i) {
+        float* row = d + i * N;
+
+        // Pass 1: find row maximum (for numerical stability)
+        float max_val = row[0];
+        for (std::size_t j = 1; j < N; ++j) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        // Pass 2: compute shifted exponentials and their sum
+        float row_sum = 0.0f;
+        for (std::size_t j = 0; j < N; ++j) {
+            row[j] = std::exp(row[j] - max_val);
+            row_sum += row[j];
+        }
+
+        // Pass 3: normalize
+        const float inv_sum = 1.0f / row_sum;
+        for (std::size_t j = 0; j < N; ++j) {
+            row[j] *= inv_sum;
+        }
+    }
+}
+
+// ============================================================================
+//  log_softmax_inplace  — row-wise log-softmax  (numerically stable)
+// ============================================================================
+//
+//  For each row i of X (M × N):
+//    1. Find max_val = max_j X[i][j]
+//    2. Compute log_sum_exp = max_val + log(Σ_k exp(X[i][k] - max_val))
+//    3. X[i][j] = X[i][j] - log_sum_exp
+//
+//  This is mathematically equivalent to log(softmax(X)) but avoids
+//  computing softmax probabilities that may underflow to zero.
+//
+//  GNN usage:
+//    • Node classification:  loss = NLL(log_softmax(scores), labels)
+//    • Numerically stable log-probability output for graph-level tasks
+//
+// ============================================================================
+void log_softmax_inplace(Tensor& X) {
+    require_dense(X, "log_softmax_inplace");
+
+    const std::size_t M = X.rows();
+    const std::size_t N = X.cols();
+
+    if (N == 0) {
+        throw std::invalid_argument(
+            "log_softmax_inplace: tensor has 0 columns — log-softmax over "
+            "an empty set is undefined.");
+    }
+
+    if (M == 0) return;  // no rows → nothing to do
+
+    float* __restrict__ d = X.data().data();
+
+    for (std::size_t i = 0; i < M; ++i) {
+        float* row = d + i * N;
+
+        // Pass 1: find row maximum
+        float max_val = row[0];
+        for (std::size_t j = 1; j < N; ++j) {
+            if (row[j] > max_val) max_val = row[j];
+        }
+
+        // Pass 2: compute sum of shifted exponentials
+        float sum_exp = 0.0f;
+        for (std::size_t j = 0; j < N; ++j) {
+            sum_exp += std::exp(row[j] - max_val);
+        }
+
+        // log_sum_exp = max_val + log(sum_exp)
+        const float log_sum_exp = max_val + std::log(sum_exp);
+
+        // Pass 3: subtract log_sum_exp from each element
+        for (std::size_t j = 0; j < N; ++j) {
+            row[j] -= log_sum_exp;
+        }
+    }
+}
+
+// ============================================================================
+//  add_bias  — broadcasting bias addition  (in-place)
+// ============================================================================
+//
+//  X[i][j] += bias[0][j]   for all rows i.
+//
+//  The bias must be shape (1 × N) where N == X.cols().  This broadcasts
+//  the single bias row across all M rows of X, implementing the bias
+//  term in a GNN linear layer:  H' = Adj × H × W + b
+//
+//  Complexity: O(M × N)  — one pass over all elements of X
+//  Memory:     O(1) extra — modifies X in-place
+//
+// ============================================================================
+void add_bias(Tensor& X, const Tensor& bias) {
+    require_dense(X, "add_bias (X)");
+
+    if (bias.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "add_bias: bias tensor must be Dense (got SparseCSR).");
+    }
+
+    const std::size_t M = X.rows();
+    const std::size_t N = X.cols();
+
+    if (bias.rows() != 1 || bias.cols() != N) {
+        throw std::invalid_argument(
+            "add_bias: bias must be shape (1×" + std::to_string(N) +
+            ") to match X columns, but got (" +
+            std::to_string(bias.rows()) + "×" +
+            std::to_string(bias.cols()) + ").");
+    }
+
+    float*       __restrict__ x = X.data().data();
+    const float* __restrict__ b = bias.data().data();
+
+    for (std::size_t i = 0; i < M; ++i) {
+        for (std::size_t j = 0; j < N; ++j) {
+            x[i * N + j] += b[j];
+        }
+    }
 }
 
 }  // namespace tinygnn

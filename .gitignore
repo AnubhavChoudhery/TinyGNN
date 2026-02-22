@@ -28,3 +28,9 @@ compile_commands.json
 # OS files
 Thumbs.db
 .DS_Store
+
+# Valgrind / sanitizer artifacts
+build/valgrind/
+build/sanitizers/
+*.log
+callgrind.out*

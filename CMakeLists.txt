@@ -21,6 +21,7 @@ endif()
 add_library(tinygnn_core
     src/tensor.cpp
     src/graph_loader.cpp
+    src/ops.cpp
 )
 
 target_include_directories(tinygnn_core PUBLIC
@@ -37,3 +38,7 @@ add_test(NAME TensorTests COMMAND test_tensor)
 add_executable(test_graph_loader tests/test_graph_loader.cpp)
 target_link_libraries(test_graph_loader PRIVATE tinygnn_core)
 add_test(NAME GraphLoaderTests COMMAND test_graph_loader)
+
+add_executable(test_matmul tests/test_matmul.cpp)
+target_link_libraries(test_matmul PRIVATE tinygnn_core)
+add_test(NAME MatmulTests COMMAND test_matmul)

@@ -19,6 +19,8 @@ SRCS_GRAPH="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT
 SRCS_MATMUL="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_matmul.cpp"
 SRCS_SPMM="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_spmm.cpp"
 SRCS_ACTIVATIONS="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_activations.cpp"
+SRCS_GCN="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gcn.cpp"
+SRCS_GRAPHSAGE="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_graphsage.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -114,6 +116,26 @@ run_config "activations_ubsan" "-fsanitize=undefined" "$SRCS_ACTIVATIONS"
 
 # 15. Combined ASan + UBSan
 run_config "activations_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_ACTIVATIONS"
+
+# ── GCN Layer tests ──
+# 16. AddressSanitizer + LeakSanitizer
+run_config "gcn_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_GCN"
+
+# 17. UndefinedBehaviorSanitizer
+run_config "gcn_ubsan" "-fsanitize=undefined" "$SRCS_GCN"
+
+# 18. Combined ASan + UBSan
+run_config "gcn_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GCN"
+
+# ── GraphSAGE Layer tests ──
+# 19. AddressSanitizer + LeakSanitizer
+run_config "graphsage_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_GRAPHSAGE"
+
+# 20. UndefinedBehaviorSanitizer
+run_config "graphsage_ubsan" "-fsanitize=undefined" "$SRCS_GRAPHSAGE"
+
+# 21. Combined ASan + UBSan
+run_config "graphsage_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GRAPHSAGE"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -21,6 +21,7 @@ SRCS_SPMM="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/tes
 SRCS_ACTIVATIONS="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/tests/test_activations.cpp"
 SRCS_GCN="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gcn.cpp"
 SRCS_GRAPHSAGE="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_graphsage.cpp"
+SRCS_GAT="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gat.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -136,6 +137,16 @@ run_config "graphsage_ubsan" "-fsanitize=undefined" "$SRCS_GRAPHSAGE"
 
 # 21. Combined ASan + UBSan
 run_config "graphsage_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GRAPHSAGE"
+
+# ── GAT Layer tests ──
+# 22. AddressSanitizer + LeakSanitizer
+run_config "gat_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_GAT"
+
+# 23. UndefinedBehaviorSanitizer
+run_config "gat_ubsan" "-fsanitize=undefined" "$SRCS_GAT"
+
+# 24. Combined ASan + UBSan
+run_config "gat_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GAT"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

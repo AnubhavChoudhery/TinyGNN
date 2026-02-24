@@ -22,6 +22,7 @@ BIN_SPMM="$BUILD_DIR/test_spmm_vg"
 BIN_ACTIVATIONS="$BUILD_DIR/test_activations_vg"
 BIN_GCN="$BUILD_DIR/test_gcn_vg"
 BIN_GRAPHSAGE="$BUILD_DIR/test_graphsage_vg"
+BIN_GAT="$BUILD_DIR/test_gat_vg"
 LOG_DIR="$PROJ_ROOT/build/valgrind/logs"
 SRC_INCLUDE="-I $PROJ_ROOT/include"
 
@@ -83,6 +84,14 @@ g++ -std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer \
     "$PROJ_ROOT/tests/test_graphsage.cpp" \
     -o "$BIN_GRAPHSAGE"
 
+g++ -std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer \
+    $SRC_INCLUDE \
+    "$PROJ_ROOT/src/tensor.cpp" \
+    "$PROJ_ROOT/src/ops.cpp" \
+    "$PROJ_ROOT/src/layers.cpp" \
+    "$PROJ_ROOT/tests/test_gat.cpp" \
+    -o "$BIN_GAT"
+
 echo "  Binary (tensor):       $BIN"
 echo "  Binary (graph_loader): $BIN_GRAPH"
 echo "  Binary (matmul):       $BIN_MATMUL"
@@ -90,6 +99,7 @@ echo "  Binary (spmm):         $BIN_SPMM"
 echo "  Binary (activations):  $BIN_ACTIVATIONS"
 echo "  Binary (gcn):          $BIN_GCN"
 echo "  Binary (graphsage):    $BIN_GRAPHSAGE"
+echo "  Binary (gat):          $BIN_GAT"
 echo "  Size (tensor):       $(du -sh "$BIN" | cut -f1)"
 echo "  Size (graph_loader): $(du -sh "$BIN_GRAPH" | cut -f1)"
 echo "  Size (matmul):       $(du -sh "$BIN_MATMUL" | cut -f1)"
@@ -97,6 +107,7 @@ echo "  Size (spmm):         $(du -sh "$BIN_SPMM" | cut -f1)"
 echo "  Size (activations):  $(du -sh "$BIN_ACTIVATIONS" | cut -f1)"
 echo "  Size (gcn):          $(du -sh "$BIN_GCN" | cut -f1)"
 echo "  Size (graphsage):    $(du -sh "$BIN_GRAPHSAGE" | cut -f1)"
+echo "  Size (gat):          $(du -sh "$BIN_GAT" | cut -f1)"
 
 # ── Step 2: Verify clean run first ────────────────────────────────────────────
 echo ""
@@ -117,6 +128,8 @@ echo "  -- test_gcn --"
 "$BIN_GCN" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
 echo "  -- test_graphsage --"
 "$BIN_GRAPHSAGE" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
+echo "  -- test_gat --"
+"$BIN_GAT" 2>&1 | grep -E "Total|Passed|Failed|FAIL"
 
 # ── Step 3: Memcheck ──────────────────────────────────────────────────────────
 echo ""
@@ -250,6 +263,24 @@ valgrind \
 
 echo ""
 cat "$MEMCHECK_LOG_GRAPHSAGE" | grep -E "ERROR SUMMARY|LEAK SUMMARY|definitely lost|indirectly lost|possibly lost|still reachable|suppressed" || true
+MEMCHECK_LOG_GAT="$LOG_DIR/memcheck_gat.log"
+
+echo ""
+echo "  -- test_gat --"
+valgrind \
+    --tool=memcheck \
+    --leak-check=full \
+    --show-leak-kinds=all \
+    --track-origins=yes \
+    --errors-for-leak-kinds=all \
+    --error-exitcode=1 \
+    --log-file="$MEMCHECK_LOG_GAT" \
+    "$BIN_GAT" > /dev/null 2>&1 \
+    && echo "  [PASS] Memcheck (gat): no errors" \
+    || { echo "  [FAIL] Memcheck (gat) detected issues — see $MEMCHECK_LOG_GAT"; cat "$MEMCHECK_LOG_GAT" | grep -A3 "ERROR SUMMARY\|definitely lost\|Invalid"; }
+
+echo ""
+cat "$MEMCHECK_LOG_GAT" | grep -E "ERROR SUMMARY|LEAK SUMMARY|definitely lost|indirectly lost|possibly lost|still reachable|suppressed" || true
 # ── Step 4: Helgrind ──────────────────────────────────────────────────────────
 echo ""
 echo "══════════════════════════════════════════════════════════"
@@ -359,6 +390,21 @@ valgrind \
 
 echo ""
 cat "$HELGRIND_LOG_GRAPHSAGE" | grep "ERROR SUMMARY" || true
+
+HELGRIND_LOG_GAT="$LOG_DIR/helgrind_gat.log"
+
+echo ""
+echo "  -- test_gat --"
+valgrind \
+    --tool=helgrind \
+    --error-exitcode=1 \
+    --log-file="$HELGRIND_LOG_GAT" \
+    "$BIN_GAT" > /dev/null 2>&1 \
+    && echo "  [PASS] Helgrind (gat): no threading errors" \
+    || { echo "  [FAIL] Helgrind (gat) detected threading issues — see $HELGRIND_LOG_GAT"; cat "$HELGRIND_LOG_GAT" | grep -A3 "ERROR SUMMARY"; }
+
+echo ""
+cat "$HELGRIND_LOG_GAT" | grep "ERROR SUMMARY" || true
 
 # ── Step 5: Callgrind (perf profiling) ────────────────────────────────────────
 echo ""

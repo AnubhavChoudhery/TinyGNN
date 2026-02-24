@@ -22,6 +22,7 @@ add_library(tinygnn_core
     src/tensor.cpp
     src/graph_loader.cpp
     src/ops.cpp
+    src/layers.cpp
 )
 
 target_include_directories(tinygnn_core PUBLIC
@@ -50,3 +51,11 @@ add_test(NAME SpmmTests COMMAND test_spmm)
 add_executable(test_activations tests/test_activations.cpp)
 target_link_libraries(test_activations PRIVATE tinygnn_core)
 add_test(NAME ActivationsTests COMMAND test_activations)
+
+add_executable(test_gcn tests/test_gcn.cpp)
+target_link_libraries(test_gcn PRIVATE tinygnn_core)
+add_test(NAME GCNTests COMMAND test_gcn)
+
+add_executable(test_graphsage tests/test_graphsage.cpp)
+target_link_libraries(test_graphsage PRIVATE tinygnn_core)
+add_test(NAME GraphSAGETests COMMAND test_graphsage)

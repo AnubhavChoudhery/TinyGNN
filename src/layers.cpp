@@ -581,4 +581,297 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
     return out;
 }
 
+// ============================================================================
+//  edge_softmax — sparse row-wise softmax over CSR values
+// ============================================================================
+//
+//  For each row i, computes softmax over the non-zero entries only:
+//    α_ij = exp(v_ij - max_k(v_ik)) / Σ_k exp(v_ik - max_k(v_ik))
+//
+//  Two-pass algorithm per row:
+//    Pass 1: find row-max M_i, compute sum S_i = Σ exp(v - M_i)
+//    Pass 2: α = exp(v - M_i) / S_i
+//
+//  Empty rows (degree 0) are left unchanged (no entries to normalize).
+//
+// ============================================================================
+Tensor edge_softmax(const Tensor& A) {
+    if (A.format() != StorageFormat::SparseCSR) {
+        throw std::invalid_argument(
+            "edge_softmax: input must be SparseCSR (got Dense).");
+    }
+
+    const std::size_t N = A.rows();
+    const auto& rp     = A.row_ptr();
+    const auto& ci     = A.col_ind();
+    const auto& vals   = A.data();
+    const std::size_t nnz = vals.size();
+
+    // New values for the softmax-normalized CSR
+    std::vector<float> new_vals(nnz);
+
+    for (std::size_t i = 0; i < N; ++i) {
+        const int32_t row_start = rp[i];
+        const int32_t row_end   = rp[i + 1];
+
+        if (row_start == row_end) continue;  // empty row
+
+        // Pass 1a: find max in this row
+        float row_max = vals[row_start];
+        for (int32_t nz = row_start + 1; nz < row_end; ++nz) {
+            row_max = std::max(row_max, vals[nz]);
+        }
+
+        // Pass 1b: compute exp(v - max) and sum
+        float row_sum = 0.0f;
+        for (int32_t nz = row_start; nz < row_end; ++nz) {
+            float e = std::exp(vals[nz] - row_max);
+            new_vals[nz] = e;
+            row_sum += e;
+        }
+
+        // Pass 2: normalize
+        if (row_sum > 0.0f) {
+            const float inv_sum = 1.0f / row_sum;
+            for (int32_t nz = row_start; nz < row_end; ++nz) {
+                new_vals[nz] *= inv_sum;
+            }
+        }
+    }
+
+    // Build output CSR with same structure, new values
+    std::vector<int32_t> rp_copy(rp.begin(), rp.end());
+    std::vector<int32_t> ci_copy(ci.begin(), ci.end());
+
+    return Tensor::sparse_csr(N, A.cols(),
+                              std::move(rp_copy),
+                              std::move(ci_copy),
+                              std::move(new_vals));
+}
+
+// ============================================================================
+//  GATLayer — constructor
+// ============================================================================
+GATLayer::GATLayer(std::size_t in_features, std::size_t out_features,
+                   float negative_slope, bool use_bias, Activation act)
+    : in_features_(in_features),
+      out_features_(out_features),
+      negative_slope_(negative_slope),
+      use_bias_(use_bias),
+      activation_(act),
+      weight_(Tensor::dense(in_features, out_features)),       // zero-init
+      attn_left_(Tensor::dense(1, out_features)),              // zero-init
+      attn_right_(Tensor::dense(1, out_features)),             // zero-init
+      bias_(Tensor::dense(1, out_features))                    // zero-init
+{
+    if (in_features == 0) {
+        throw std::invalid_argument(
+            "GATLayer: in_features must be > 0.");
+    }
+    if (out_features == 0) {
+        throw std::invalid_argument(
+            "GATLayer: out_features must be > 0.");
+    }
+}
+
+// ============================================================================
+//  GATLayer — set_weight
+// ============================================================================
+void GATLayer::set_weight(Tensor w) {
+    if (w.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "GATLayer::set_weight: weight must be Dense.");
+    }
+    if (w.rows() != in_features_ || w.cols() != out_features_) {
+        throw std::invalid_argument(
+            "GATLayer::set_weight: expected shape (" +
+            std::to_string(in_features_) + "×" +
+            std::to_string(out_features_) + "), got (" +
+            std::to_string(w.rows()) + "×" +
+            std::to_string(w.cols()) + ").");
+    }
+    weight_ = std::move(w);
+}
+
+// ============================================================================
+//  GATLayer — set_attn_left
+// ============================================================================
+void GATLayer::set_attn_left(Tensor a) {
+    if (a.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "GATLayer::set_attn_left: attention vector must be Dense.");
+    }
+    if (a.rows() != 1 || a.cols() != out_features_) {
+        throw std::invalid_argument(
+            "GATLayer::set_attn_left: expected shape (1×" +
+            std::to_string(out_features_) + "), got (" +
+            std::to_string(a.rows()) + "×" +
+            std::to_string(a.cols()) + ").");
+    }
+    attn_left_ = std::move(a);
+}
+
+// ============================================================================
+//  GATLayer — set_attn_right
+// ============================================================================
+void GATLayer::set_attn_right(Tensor a) {
+    if (a.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "GATLayer::set_attn_right: attention vector must be Dense.");
+    }
+    if (a.rows() != 1 || a.cols() != out_features_) {
+        throw std::invalid_argument(
+            "GATLayer::set_attn_right: expected shape (1×" +
+            std::to_string(out_features_) + "), got (" +
+            std::to_string(a.rows()) + "×" +
+            std::to_string(a.cols()) + ").");
+    }
+    attn_right_ = std::move(a);
+}
+
+// ============================================================================
+//  GATLayer — set_bias
+// ============================================================================
+void GATLayer::set_bias(Tensor b) {
+    if (!use_bias_) {
+        throw std::invalid_argument(
+            "GATLayer::set_bias: layer was constructed with use_bias=false.");
+    }
+    if (b.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "GATLayer::set_bias: bias must be Dense.");
+    }
+    if (b.rows() != 1 || b.cols() != out_features_) {
+        throw std::invalid_argument(
+            "GATLayer::set_bias: expected shape (1×" +
+            std::to_string(out_features_) + "), got (" +
+            std::to_string(b.rows()) + "×" +
+            std::to_string(b.cols()) + ").");
+    }
+    bias_ = std::move(b);
+}
+
+// ============================================================================
+//  GATLayer — forward
+// ============================================================================
+//
+//  Complete GAT forward pass (single attention head):
+//
+//    1. Wh = matmul(H, W)                        [N × F_out]
+//    2. src_scores[i] = Σ_f  a_l[f] * Wh[i][f]   (dot product per node)
+//       dst_scores[j] = Σ_f  a_r[f] * Wh[j][f]
+//    3. For each edge (i,j) in CSR:
+//         e_ij = LeakyReLU(src_scores[i] + dst_scores[j])
+//       → Build a CSR with these attention logits as values  (SpSDDMM)
+//    4. α = edge_softmax(e_csr)                   (sparse softmax per row)
+//    5. out = spmm(α, Wh) + b                     (attention-weighted aggregation)
+//    6. activation(out)
+//
+// ============================================================================
+Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
+    // ── Validate A ───────────────────────────────────────────────────────────
+    if (A.format() != StorageFormat::SparseCSR) {
+        throw std::invalid_argument(
+            "GATLayer::forward: A must be SparseCSR (got Dense). "
+            "Use add_self_loops() to prepare the adjacency.");
+    }
+    if (A.rows() != A.cols()) {
+        throw std::invalid_argument(
+            "GATLayer::forward: A must be square — got (" +
+            std::to_string(A.rows()) + "×" + std::to_string(A.cols()) + ").");
+    }
+
+    // ── Validate H ───────────────────────────────────────────────────────────
+    if (H.format() != StorageFormat::Dense) {
+        throw std::invalid_argument(
+            "GATLayer::forward: H must be Dense (got SparseCSR).");
+    }
+    if (H.cols() != in_features_) {
+        throw std::invalid_argument(
+            "GATLayer::forward: H has " + std::to_string(H.cols()) +
+            " columns but layer expects in_features=" +
+            std::to_string(in_features_) + ".");
+    }
+    if (A.rows() != H.rows()) {
+        throw std::invalid_argument(
+            "GATLayer::forward: A has " +
+            std::to_string(A.rows()) + " rows but H has " +
+            std::to_string(H.rows()) + " rows. They must match (N nodes).");
+    }
+
+    const std::size_t N = H.rows();
+    const std::size_t F_out = out_features_;
+    const auto& rp = A.row_ptr();
+    const auto& ci = A.col_ind();
+
+    // ── Step 1: Linear transform  Wh = H · W ────────────────────────────────
+    Tensor Wh = matmul(H, weight_);   // (N × F_out)
+
+    // ── Step 2: Compute per-node attention scores (SpSDDMM preparation) ──────
+    //   src_scores[i] = a_l^T · Wh[i]   (source contribution)
+    //   dst_scores[j] = a_r^T · Wh[j]   (target contribution)
+    const float* wh_data  = Wh.data().data();
+    const float* al_data  = attn_left_.data().data();
+    const float* ar_data  = attn_right_.data().data();
+
+    std::vector<float> src_scores(N, 0.0f);
+    std::vector<float> dst_scores(N, 0.0f);
+
+    for (std::size_t i = 0; i < N; ++i) {
+        float s = 0.0f, d = 0.0f;
+        const float* whi = wh_data + i * F_out;
+        for (std::size_t f = 0; f < F_out; ++f) {
+            s += al_data[f] * whi[f];
+            d += ar_data[f] * whi[f];
+        }
+        src_scores[i] = s;
+        dst_scores[i] = d;
+    }
+
+    // ── Step 3: SpSDDMM — compute edge attention logits ─────────────────────
+    //   For each edge (i, j):  e_ij = LeakyReLU(src_scores[i] + dst_scores[j])
+    const std::size_t nnz = ci.size();
+    std::vector<float> edge_logits(nnz);
+
+    for (std::size_t i = 0; i < N; ++i) {
+        const float si = src_scores[i];
+        for (int32_t nz = rp[i]; nz < rp[i + 1]; ++nz) {
+            const auto j = static_cast<std::size_t>(ci[nz]);
+            float e = si + dst_scores[j];
+            // LeakyReLU
+            edge_logits[nz] = (e >= 0.0f) ? e : negative_slope_ * e;
+        }
+    }
+
+    // Build CSR with attention logits as values
+    std::vector<int32_t> rp_copy(rp.begin(), rp.end());
+    std::vector<int32_t> ci_copy(ci.begin(), ci.end());
+    Tensor attn_csr = Tensor::sparse_csr(N, N,
+                                         std::move(rp_copy),
+                                         std::move(ci_copy),
+                                         std::move(edge_logits));
+
+    // ── Step 4: Sparse Softmax — normalize attention per neighborhood ────────
+    Tensor alpha = edge_softmax(attn_csr);
+
+    // ── Step 5: Attention-weighted message passing  out = spmm(α, Wh) ────────
+    Tensor out = spmm(alpha, Wh);
+
+    // Bias addition
+    if (use_bias_) {
+        add_bias(out, bias_);
+    }
+
+    // ── Step 6: Activation ───────────────────────────────────────────────────
+    switch (activation_) {
+        case Activation::ReLU:
+            relu_inplace(out);
+            break;
+        case Activation::None:
+            break;
+    }
+
+    return out;
+}
+
 }  // namespace tinygnn

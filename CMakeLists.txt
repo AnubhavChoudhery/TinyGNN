@@ -59,3 +59,7 @@ add_test(NAME GCNTests COMMAND test_gcn)
 add_executable(test_graphsage tests/test_graphsage.cpp)
 target_link_libraries(test_graphsage PRIVATE tinygnn_core)
 add_test(NAME GraphSAGETests COMMAND test_graphsage)
+
+add_executable(test_gat tests/test_gat.cpp)
+target_link_libraries(test_gat PRIVATE tinygnn_core)
+add_test(NAME GATTests COMMAND test_gat)

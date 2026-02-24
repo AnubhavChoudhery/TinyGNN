@@ -15,6 +15,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 3 | Dense Compute Kernels (GEMM) | Complete |
 | 4 | Sparse Compute Kernels (SpMM) | Complete |
 | 5 | Activations & Utilities | Complete |
+| 6 | Multi-Architecture Layer Assembly | Complete |
 
 ---
 
@@ -27,25 +28,30 @@ TinyGNN/
 │   └── tinygnn/
 │       ├── tensor.hpp          # StorageFormat enum + Tensor struct
 │       ├── graph_loader.hpp    # GraphData + GraphLoader (CSV -> CSR pipeline)
-│       └── ops.hpp             # compute kernels + activations: matmul, spmm, relu, softmax, etc.
+│       ├── ops.hpp             # compute kernels + activations: matmul, spmm, relu, softmax, etc.
+│       └── layers.hpp          # GCN, GraphSAGE, GAT layer structs + helpers
 ├── src/
 │   ├── tensor.cpp
 │   ├── graph_loader.cpp        # CSV parser + edge-list-to-CSR conversion
-│   └── ops.cpp                 # matmul, spmm, relu, leaky_relu, elu, sigmoid, tanh, gelu, softmax, log_softmax, add_bias
+│   ├── ops.cpp                 # matmul, spmm, relu, leaky_relu, elu, sigmoid, tanh, gelu, softmax, log_softmax, add_bias
+│   └── layers.cpp              # add_self_loops, gcn_norm, GCNLayer, SAGELayer, GATLayer, edge_softmax
 ├── tests/
 │   ├── test_tensor.cpp         # Phase 1 -- 104 assertions
 │   ├── test_graph_loader.cpp   # Phase 2 -- 269 assertions
 │   ├── test_matmul.cpp         # Phase 3 -- 268 assertions
 │   ├── test_spmm.cpp           # Phase 4 -- 306 assertions
-│   └── test_activations.cpp    # Phase 5 -- 266 assertions
+│   ├── test_activations.cpp    # Phase 5 -- 266 assertions
+│   ├── test_gcn.cpp            # Phase 6a -- 764 assertions
+│   ├── test_graphsage.cpp      # Phase 6b -- 1,011 assertions
+│   └── test_gat.cpp            # Phase 6c -- 1,284 assertions
 ├── datasets/                   # downloaded via scripts/fetch_datasets.py
 │   ├── cora/                   # 2,708 nodes, 5,429 edges, 1,433 features
 │   └── reddit/                 # 232,965 nodes, 114,615,892 edges, 602 features
 └── scripts/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
     ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
-    ├── sanitizers.sh           # ASan + UBSan (15 configs, all 5 phases)
-    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 5 phases)
+    ├── sanitizers.sh           # ASan + UBSan (24 configs, all 6 phases)
+    └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 6 phases)
 ```
 
 ---
@@ -89,6 +95,24 @@ g++ -std=c++17 -Wall -Wextra -I include \
 g++ -std=c++17 -Wall -Wextra -I include \
     src/tensor.cpp src/ops.cpp tests/test_activations.cpp \
     -o build/test_activations && ./build/test_activations
+```
+
+# Phase 6 -- GCN, GraphSAGE, GAT Layers
+```bash
+# Phase 6a -- GCN Layer
+g++ -std=c++17 -Wall -Wextra -I include \
+    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_gcn.cpp \
+    -o build/test_run/test_gcn && ./build/test_run/test_gcn
+
+# Phase 6b -- GraphSAGE Layer
+g++ -std=c++17 -Wall -Wextra -I include \
+    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_graphsage.cpp \
+    -o build/test_run/test_graphsage && ./build/test_run/test_graphsage
+
+# Phase 6c -- GAT Layer
+g++ -std=c++17 -Wall -Wextra -I include \
+    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_gat.cpp \
+    -o build/test_run/test_gat && ./build/test_run/test_gat
 ```
 
 ### Memory safety (WSL / Linux)
@@ -616,6 +640,141 @@ Failed: 0
 
 ---
 
+## Phase 6 -- Multi-Architecture Layer Assembly
+
+### Goal
+Assemble complete GNN layer architectures from the tensor primitives built in Phases 1–5, implementing the three canonical propagation strategies: GCN (spectral normalization), GraphSAGE (inductive mean/max aggregation), and GAT (attention-based message passing).
+
+### Design
+
+#### Helper functions
+```cpp
+// Â = A + I  — insert identity self-loops into CSR (two-pass: detect diag, rebuild)
+Tensor add_self_loops(const Tensor& A);
+
+// D̃^(-1/2) Â D̃^(-1/2)  — symmetric GCN normalization
+Tensor gcn_norm(const Tensor& A);
+
+// Row-wise sparse softmax over CSR non-zeros only (max-subtract, two-pass)
+Tensor edge_softmax(const Tensor& A);
+
+// Element-wise max pooling over CSR neighborhoods
+Tensor sage_max_aggregate(const Tensor& A, const Tensor& H);
+```
+
+#### GCN Layer (`GCNLayer`)
+*Kipf & Welling, ICLR 2017*
+```
+H' = σ( Â_norm · (H · W) + b )
+
+  ̂   precomputed by gcn_norm():  D̃^(-1/2) (A+I) D̃^(-1/2)
+A = precomputed
+Forward:
+  Step 1: HW  = matmul(H, W)       [N × F_in] × [F_in × F_out] → [N × F_out]
+  Step 2: out = spmm(Â_norm, HW)  sparse message-passing
+  Step 3: add_bias(out, b)           optional
+  Step 4: σ(out)                     ReLU or None
+```
+
+#### GraphSAGE Layer (`SAGELayer`)
+*Hamilton, Ying & Leskovec, NeurIPS 2017*
+```
+h_v' = σ( W_neigh · AGG({h_u : u ∈ N(v)}) + W_self · h_v + b )
+
+AGG variants:
+  Mean: spmm(A, H) / degree[v]             (normalized neighbor sum)
+  Max:  element-wise max over CSR row       (sage_max_aggregate)
+
+Forward:
+  Step 1: agg    = Mean-spmm or sage_max_aggregate
+  Step 2: h_neigh = matmul(agg, W_neigh)
+  Step 3: h_self  = matmul(H,   W_self)
+  Step 4: out    = h_neigh + h_self        (element-wise add)
+  Step 5: add_bias(out, b)                 optional
+  Step 6: σ(out)                            ReLU or None
+```
+
+#### GAT Layer (`GATLayer`)
+*Veličković et al., ICLR 2018*
+```
+Forward (single attention head):
+  Step 1: Wh          = matmul(H, W)                     [N × F_out]
+  Step 2: src[i]      = a_l · Wh[i],  dst[j] = a_r · Wh[j]   per node
+  Step 3: e_ij        = LeakyReLU(src[i] + dst[j])       SpSDDMM — one value per CSR edge
+  Step 4: α           = edge_softmax(e_csr)               sparse softmax per row
+  Step 5: out         = spmm(α, Wh) + b                  attention-weighted aggregation
+  Step 6: σ(out)
+
+Weights: W (F_in×F_out), a_l (1×F_out), a_r (1×F_out), b (1×F_out)
+A must include self-loops (use add_self_loops before forward).
+```
+
+### Phase 6a: GCN Layer
+
+#### Test suite -- 764 assertions, 68 test functions, 0 failures
+
+| Category | Tests | Covers |
+|----------|-------|--------|
+| add_self_loops | 7 | basic, already-has-diagonal, empty |
+| gcn_norm | 7 | hand-verified D̃^(-1/2) Â D̃^(-1/2) values |
+| GCNLayer construction + weight management | 8 | shape checks, wrong-format, wrong-shape throws |
+| GCNLayer forward — 3-node hand-computed | 6 | row-by-row numerical verification |
+| GCNLayer forward — no bias, no activation | 5 | identity propagation |
+| Two-layer GCN stacking | 4 | output shape and feature composition |
+| 10-node ring graph — full pipeline | 11 | symmetry, degree normalization, activation |
+| Error handling | 12 | wrong formats, dimension mismatches, error messages |
+| Edge / degenerate cases | 8 | single node, isolated nodes, identity adjacency |
+
+```
+Total : 764
+Passed: 764
+Failed: 0
+```
+
+### Phase 6b: GraphSAGE Layer
+
+#### Test suite -- 1,011 assertions, 60 test functions, 0 failures
+
+| Category | Tests | Covers |
+|----------|-------|--------|
+| sage_max_aggregate | 8 | basic, empty graph, single node |
+| SAGELayer construction + weight management | 9 | shape checks, aggregator type, wrong-format throws |
+| SAGELayer Mean forward — 3-node hand-computed | 7 | degree normalization, W_neigh/W_self combination |
+| SAGELayer Max forward — 3-node hand-computed | 7 | max pooling, W_neigh/W_self combination |
+| Multi-layer GraphSAGE | 4 | two-layer composition, feature dimension flow |
+| 10-node graph tests | 7 | mean vs max comparison, scale, bias/activation |
+| Error handling | 10 | dense A, sparse H, dimension mismatches, messages |
+| Edge / degenerate cases | 8 | isolated nodes get zero aggregation |
+
+```
+Total : 1011
+Passed: 1011
+Failed: 0
+```
+
+### Phase 6c: GAT Layer
+
+#### Test suite -- 1,284 assertions, 60 test functions, 0 failures
+
+| Category | Tests | Covers |
+|----------|-------|--------|
+| edge_softmax | 10 | row sums = 1, uniform input, single-entry rows, numerical stability |
+| GATLayer construction + weight management | 12 | shape checks, wrong-format, wrong-shape throws |
+| GATLayer forward — 3-node hand-computed | 10 | attention score computation, softmax, weighted SpMM |
+| GATLayer forward — bias and activation | 8 | bias add, ReLU gate |
+| Multi-layer GAT + mixed layer stacking | 6 | GAT→GAT, GCN→GAT, SAGEMax→GAT compositions |
+| Larger graph tests (10-node, 100-node) | 8 | scale, output shape, attention normalization |
+| Error handling | 10 | wrong formats, dimension mismatches, negative slope validation |
+| Edge / degenerate cases | 6 | self-loop-only, single node, all-zero attention |
+
+```
+Total : 1284
+Passed: 1284
+Failed: 0
+```
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -625,21 +784,24 @@ Failed: 0
 | 3 | test_matmul.cpp | 30 | 268 | 268 / 268 |
 | 4 | test_spmm.cpp | 35 | 306 | 306 / 306 |
 | 5 | test_activations.cpp | 70 | 266 | 266 / 266 |
-| **Total** | | **202** | **1,213** | **1,213 / 1,213** |
+| 6a | test_gcn.cpp | 68 | 764 | 764 / 764 |
+| 6b | test_graphsage.cpp | 60 | 1,011 | 1,011 / 1,011 |
+| 6c | test_gat.cpp | 60 | 1,284 | 1,284 / 1,284 |
+| **Total** | | **390** | **4,272** | **4,272 / 4,272** |
 
 ---
 
 ## Memory Safety
 
-All five phases pass the full sanitizer matrix with zero errors:
+All six phases pass the full sanitizer matrix with zero errors:
 
-| Config | Tensor | Graph Loader | Matmul | SpMM | Activations |
-|--------|--------|--------------|--------|------|-------------|
-| ASan + LSan | Pass | Pass | Pass | Pass | Pass |
-| UBSan | Pass | Pass | Pass | Pass | Pass |
-| ASan + UBSan combined | Pass | Pass | Pass | Pass | Pass |
-| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
-| Valgrind Helgrind | 0 races | 0 races | 0 races | 0 races | 0 races |
+| Config | Tensor | Graph Loader | Matmul | SpMM | Activations | GCN | GraphSAGE | GAT |
+|--------|--------|--------------|--------|------|-------------|-----|-----------|-----|
+| ASan + LSan | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| UBSan | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| ASan + UBSan combined | Pass | Pass | Pass | Pass | Pass | Pass | Pass | Pass |
+| Valgrind Memcheck | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks | 0 errors, 0 leaks |
+| Valgrind Helgrind | 0 races | 0 races | 0 races | 0 races | 0 races | 0 races | 0 races | 0 races |
 
 ---
 

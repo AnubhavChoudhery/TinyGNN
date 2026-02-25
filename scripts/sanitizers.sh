@@ -22,6 +22,7 @@ SRCS_ACTIVATIONS="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/te
 SRCS_GCN="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gcn.cpp"
 SRCS_GRAPHSAGE="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_graphsage.cpp"
 SRCS_GAT="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gat.cpp"
+SRCS_E2E="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/src/model.cpp $PROJ_ROOT/tests/test_e2e.cpp"
 CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
 
 mkdir -p "$BUILD_DIR"
@@ -147,6 +148,16 @@ run_config "gat_ubsan" "-fsanitize=undefined" "$SRCS_GAT"
 
 # 24. Combined ASan + UBSan
 run_config "gat_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_GAT"
+
+# ── E2E Pipeline tests ──
+# 25. AddressSanitizer + LeakSanitizer
+run_config "e2e_asan_lsan" "-fsanitize=address -fsanitize=leak" "$SRCS_E2E"
+
+# 26. UndefinedBehaviorSanitizer
+run_config "e2e_ubsan" "-fsanitize=undefined" "$SRCS_E2E"
+
+# 27. Combined ASan + UBSan
+run_config "e2e_asan_ubsan" "-fsanitize=address,undefined" "$SRCS_E2E"
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo ""

@@ -23,6 +23,7 @@ add_library(tinygnn_core
     src/graph_loader.cpp
     src/ops.cpp
     src/layers.cpp
+    src/model.cpp
 )
 
 target_include_directories(tinygnn_core PUBLIC
@@ -63,3 +64,7 @@ add_test(NAME GraphSAGETests COMMAND test_graphsage)
 add_executable(test_gat tests/test_gat.cpp)
 target_link_libraries(test_gat PRIVATE tinygnn_core)
 add_test(NAME GATTests COMMAND test_gat)
+
+add_executable(test_e2e tests/test_e2e.cpp)
+target_link_libraries(test_e2e PRIVATE tinygnn_core)
+add_test(NAME E2ETests COMMAND test_e2e)

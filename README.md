@@ -17,6 +17,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 5 | Activations & Utilities | Complete |
 | 6 | Multi-Architecture Layer Assembly | Complete |
 | 7 | Multi-Model End-to-End Pipeline & Reference Matching | Complete |
+| 8 | Python Bridge (pybind11) | Complete |
 
 ---
 
@@ -25,6 +26,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 ```
 TinyGNN/
 ├── CMakeLists.txt
+├── setup.py                    # Phase 8: pybind11 Python extension build
 ├── include/
 │   └── tinygnn/
 │       ├── tensor.hpp          # StorageFormat enum + Tensor struct
@@ -38,6 +40,10 @@ TinyGNN/
 │   ├── ops.cpp                 # matmul, spmm, relu, leaky_relu, elu, sigmoid, tanh, gelu, softmax, log_softmax, add_bias
 │   ├── layers.cpp              # add_self_loops, gcn_norm, GCNLayer, SAGELayer, GATLayer, edge_softmax
 │   └── model.cpp               # Model::forward(), load_cora_binary(), load_weight_file()
+├── python/
+│   ├── tinygnn_ext.cpp         # Phase 8: pybind11 C++ bindings (280+ lines)
+│   └── tinygnn/
+│       └── __init__.py         # Phase 8: Python package re-exports
 ├── tests/
 │   ├── test_tensor.cpp         # Phase 1 -- 104 assertions
 │   ├── test_graph_loader.cpp   # Phase 2 -- 269 assertions
@@ -47,7 +53,8 @@ TinyGNN/
 │   ├── test_gcn.cpp            # Phase 6a -- 764 assertions
 │   ├── test_graphsage.cpp      # Phase 6b -- 1,011 assertions
 │   ├── test_gat.cpp            # Phase 6c -- 1,284 assertions
-│   └── test_e2e.cpp            # Phase 7  -- 13,862 assertions (end-to-end pipeline)
+│   ├── test_e2e.cpp            # Phase 7  -- 13,862 assertions (end-to-end pipeline)
+│   └── test_python_bindings.py # Phase 8  -- 49 pytest tests (Python bridge)
 ├── datasets/                   # downloaded via scripts/fetch_datasets.py
 │   ├── cora/                   # 2,708 nodes, 5,429 edges, 1,433 features
 │   └── reddit/                 # 232,965 nodes, 114,615,892 edges, 602 features
@@ -60,6 +67,8 @@ TinyGNN/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
     ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
     ├── train_cora.py           # PyG training: GCN/SAGE/GAT → binary weight export
+    ├── validate_cora.py        # Phase 8: PyG ↔ TinyGNN logit-level comparison
+    ├── build_python.py         # Phase 8: build Python extension + run tests
     ├── sanitizers.sh           # ASan + UBSan (27 configs, all 7 phases)
     └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all 7 phases)
 ```
@@ -135,6 +144,24 @@ python3 scripts/train_cora.py
 g++ -std=c++17 -Wall -Wextra -I include \
     src/tensor.cpp src/graph_loader.cpp src/ops.cpp src/layers.cpp src/model.cpp \
     tests/test_e2e.cpp -o build/test_e2e && ./build/test_e2e
+```
+
+# Phase 8 -- Python Bridge (pybind11)
+```bash
+# Install dependencies
+pip install pybind11 numpy scipy pytest
+
+# Build the Python extension (MinGW on Windows)
+python setup.py build_ext --inplace --compiler=mingw32
+
+# Or use the build helper script
+python scripts/build_python.py
+
+# Run Python binding tests (49 tests)
+python -m pytest tests/test_python_bindings.py -v
+
+# Run Cora validation (logit-level comparison with PyG)
+python scripts/validate_cora.py --logit-check
 ```
 
 ### Memory safety (WSL / Linux)
@@ -891,6 +918,96 @@ Failed:       0
 
 ---
 
+## Phase 8 -- Python Bridge (pybind11)
+
+### Goal
+Expose the entire TinyGNN C++ inference engine to Python via pybind11, enabling researchers to `import tinygnn` and run GNN inference from Python with NumPy/SciPy/PyTorch interoperability.
+
+### Architecture
+
+#### pybind11 Bindings (`python/tinygnn_ext.cpp`)
+A single C++ source wrapping the full TinyGNN API:
+- **Tensor** — zero-copy NumPy interop via `from_numpy()`, `to_numpy()`, SciPy CSR via `from_scipy_csr()`, PyG edge_index via `from_edge_index()`
+- **Ops** — all 8 activations, matmul, spmm, add_bias (in-place semantics preserved)
+- **Graph utilities** — add_self_loops, gcn_norm, edge_softmax, sage_max_aggregate
+- **Layers** — GCNLayer, SAGELayer (Mean/Max), GATLayer with full weight management
+- **Model** — dynamic execution graph with weight loading from TGNN binary files
+- **I/O** — load_cora_binary, load_weight_file, GraphLoader
+
+#### Build System (`setup.py`)
+- Uses setuptools + pybind11 C++ extension
+- MinGW cross-compilation with static GCC runtime linking (no DLL dependencies)
+- Produces `_tinygnn_core.cp312-win_amd64.pyd` (~558 KB)
+- Clean `pip install -e .` or `python setup.py build_ext --inplace`
+
+#### Python Package (`python/tinygnn/`)
+```python
+import tinygnn
+import numpy as np
+
+# Create tensor from NumPy
+X = tinygnn.Tensor.from_numpy(np.random.randn(10, 16).astype(np.float32))
+
+# Build and run GCN model
+model = tinygnn.Model()
+model.add_gcn_layer(1433, 64, activation=tinygnn.Activation.RELU)
+model.add_gcn_layer(64, 7, activation=tinygnn.Activation.NONE)
+model.load_weights("weights/gcn_cora.bin")
+logits = model.forward(adjacency, features)
+result = logits.to_numpy()  # → NumPy array
+```
+
+#### Zero-Copy Interop
+
+| Method | Direction | Data Type |
+|--------|-----------|-----------|
+| `Tensor.from_numpy(arr)` | NumPy → TinyGNN | 2D float32/float64 array → Dense Tensor |
+| `Tensor.from_numpy_1d(arr)` | NumPy → TinyGNN | 1D array → (1×N) Dense Tensor (bias) |
+| `Tensor.to_numpy()` | TinyGNN → NumPy | Dense Tensor → 2D float32 array |
+| `Tensor.from_scipy_csr(mat)` | SciPy → TinyGNN | csr_matrix → SparseCSR Tensor |
+| `Tensor.from_edge_index(ei, N)` | PyG → TinyGNN | (2×E) int32 COO → SparseCSR Tensor |
+| `Tensor.row_ptr_numpy()` | TinyGNN → NumPy | CSR row_ptr as int32 array |
+| `Tensor.col_ind_numpy()` | TinyGNN → NumPy | CSR col_ind as int32 array |
+
+### Cora Validation (`scripts/validate_cora.py`)
+
+Two validation modes:
+
+**Mode 1 — Weight File Validation**: Loads pre-trained weights, runs TinyGNN inference, verifies test accuracy within 1% of expected.
+
+**Mode 2 — Logit-Level Comparison**: Trains a fresh GCN in PyG, exports weights, runs both PyG and TinyGNN on identical inputs, asserts logits match:
+
+| Metric | Result |
+|--------|--------|
+| Max absolute logit diff | 0.000002 |
+| Mean absolute logit diff | 0.000000 |
+| Mean relative diff | 0.000001 |
+| Prediction agreement | **100.0%** |
+
+### Test Suite -- 49 pytest tests, 0 failures
+
+| Category | Tests | Covers |
+|----------|-------|--------|
+| Dense Tensor | 9 | creation, from_numpy, to_numpy, roundtrip, repr, memory |
+| Sparse CSR Tensor | 5 | creation, CSR accessors, from_scipy, from_edge_index, error |
+| Ops (matmul/spmm) | 4 | identity, values, SpMM identity, SpMM aggregation |
+| Activations | 9 | relu, leaky_relu, elu, sigmoid, tanh, gelu, softmax, log_softmax, add_bias |
+| Graph utilities | 4 | add_self_loops, gcn_norm, edge_softmax, sage_max_aggregate |
+| GCN Layer | 3 | construction, identity weight forward, ReLU forward |
+| SAGE Layer | 4 | Mean/Max construction, Mean forward, Max forward |
+| GAT Layer | 2 | construction, forward pass |
+| Model | 3 | GCN model build+forward, SAGE model build+forward, weight file loading |
+| Enums | 3 | StorageFormat, Activation, Aggregator |
+| Error handling | 3 | wrong ndim, sparse-to-numpy, bad edge_index shape |
+
+```
+Tests run:    49
+Passed:       49
+Failed:       0
+```
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -904,7 +1021,8 @@ Failed:       0
 | 6b | test_graphsage.cpp | 60 | 1,011 | 1,011 / 1,011 |
 | 6c | test_gat.cpp | 60 | 1,284 | 1,284 / 1,284 |
 | 7 | test_e2e.cpp | 26 | 13,862 | 13,862 / 13,862 |
-| **Total** | | **416** | **18,134** | **18,134 / 18,134** |
+| 8 | test_python_bindings.py | 49 | 49 (pytest) | 49 / 49 |
+| **Total** | | **465** | **18,183** | **18,183 / 18,183** |
 
 ---
 

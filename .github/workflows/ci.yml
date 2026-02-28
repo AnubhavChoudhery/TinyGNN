@@ -1,0 +1,197 @@
+# =============================================================================
+#  TinyGNN — Continuous Integration / Continuous Deployment
+#  .github/workflows/ci.yml
+#
+#  Triggered on:
+#    • Every push to main
+#    • Every pull request targeting main
+#
+#  Jobs:
+#    1. cpp-build-test     — CMake build + CTest (Linux, macOS, Windows)
+#    2. python-build-test  — pip install + pytest (Linux, Windows)
+#    3. sanitizers         — ASan + UBSan memory safety checks (Linux)
+#    4. docs               — Build Doxygen + Sphinx documentation (Linux)
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  Job 1: C++ Build + Test (CMake)
+  # ═══════════════════════════════════════════════════════════════════════════
+  cpp-build-test:
+    name: C++ (${{ matrix.os }}, ${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            compiler: clang
+            cc: clang
+            cxx: clang++
+          - os: windows-latest
+            compiler: msvc
+            cc: cl
+            cxx: cl
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenMP (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Configure CMake
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Run C++ tests
+        run: ctest --test-dir build --output-on-failure --config Release -j4
+        # Note: test_e2e requires dataset files (skipped in CI if not present)
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  Job 2: Python Build + Test (pybind11 + pytest)
+  # ═══════════════════════════════════════════════════════════════════════════
+  python-build-test:
+    name: Python (${{ matrix.os }}, ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.10"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: windows-latest
+            python-version: "3.12"
+          - os: macos-latest
+            python-version: "3.12"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build dependencies
+        run: pip install pybind11 numpy setuptools wheel
+
+      - name: Install OpenMP (macOS)
+        if: runner.os == 'macOS'
+        run: brew install libomp
+
+      - name: Build extension (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: python setup.py build_ext --inplace
+
+      - name: Build extension (Windows)
+        if: runner.os == 'Windows'
+        run: pip install -e .
+
+      - name: Install test dependencies
+        run: pip install pytest scipy
+
+      - name: Run Python tests
+        run: python -m pytest tests/test_python_bindings.py -v --tb=short
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  Job 3: Memory Safety — ASan + UBSan (Linux only)
+  # ═══════════════════════════════════════════════════════════════════════════
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure CMake with sanitizers
+        env:
+          CC: gcc
+          CXX: g++
+          CXXFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          LDFLAGS: "-fsanitize=address,undefined"
+        run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build with sanitizers
+        run: cmake --build build-san --parallel
+
+      - name: Run tests under ASan + UBSan
+        env:
+          ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
+          UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
+        run: |
+          cd build-san
+          # Run each test individually for clear error attribution
+          for test in test_tensor test_graph_loader test_matmul test_spmm \
+                      test_activations test_gcn test_graphsage test_gat; do
+            echo "=== Running $test under ASan+UBSan ==="
+            ./$test
+            echo "=== $test PASSED ==="
+          done
+          echo "All sanitizer tests passed!"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  Job 4: Documentation Build (Doxygen + Sphinx)
+  # ═══════════════════════════════════════════════════════════════════════════
+  docs:
+    name: Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Doxygen
+        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz
+
+      - name: Generate Doxygen C++ docs
+        run: doxygen Doxyfile
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Sphinx dependencies
+        run: pip install sphinx sphinx-rtd-theme breathe
+
+      - name: Build Sphinx documentation
+        run: |
+          cd docs
+          make html
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: docs/_build/html/
+          retention-days: 30

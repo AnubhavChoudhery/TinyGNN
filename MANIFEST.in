@@ -1,0 +1,40 @@
+# Include C++ source and headers for source distributions
+include CMakeLists.txt
+include README.md
+include LICENSE
+include pyproject.toml
+include setup.py
+
+# C++ sources
+recursive-include include *.hpp
+recursive-include src *.cpp
+
+# pybind11 bindings
+include python/tinygnn_ext.cpp
+recursive-include python/tinygnn *.py
+
+# Benchmarks (for reference, not required for build)
+recursive-include benchmarks *.cpp
+
+# Scripts
+recursive-include scripts *.py *.sh
+
+# Tests
+recursive-include tests *.cpp *.py
+
+# Documentation
+recursive-include docs *
+include Doxyfile
+include CITATION.cff
+include CONTRIBUTING.md
+
+# Exclude build artifacts
+global-exclude *.o *.obj *.exe *.dll *.so *.dylib *.pyd
+global-exclude __pycache__ *.pyc
+prune build
+prune build-cpp
+prune .venv
+prune venv
+prune datasets
+prune weights
+prune .git

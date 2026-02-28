@@ -1,0 +1,96 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel", "pybind11>=2.11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinygnn"
+version = "0.1.0"
+description = "TinyGNN — A zero-dependency C++17 inference engine for Sparse Graph Neural Networks with Python bindings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Jai Ansh Singh Bindra"},
+    {name = "Anubhav Choudhery"},
+]
+maintainers = [
+    {name = "Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)"},
+]
+keywords = [
+    "graph-neural-networks",
+    "gnn",
+    "sparse",
+    "inference",
+    "machine-learning",
+    "deep-learning",
+    "gcn",
+    "graphsage",
+    "gat",
+    "pybind11",
+    "c++",
+    "zero-dependency",
+    "simd",
+    "avx2",
+    "openmp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "pybind11>=2.11",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0", "scipy>=1.7", "torch"]
+pyg = ["torch_geometric"]
+docs = ["sphinx>=7.0", "sphinx-rtd-theme>=2.0", "breathe>=4.35"]
+dev = ["pytest>=7.0", "scipy>=1.7", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/JaiAnshSB/TinyGNN"
+Documentation = "https://github.com/JaiAnshSB/TinyGNN#readme"
+Repository = "https://github.com/JaiAnshSB/TinyGNN"
+"Bug Tracker" = "https://github.com/JaiAnshSB/TinyGNN/issues"
+
+[tool.setuptools]
+packages = ["tinygnn"]
+
+[tool.setuptools.package-dir]
+tinygnn = "python/tinygnn"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.cibuildwheel]
+build = "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-win32 *-manylinux_i686 *-musllinux*"
+test-requires = ["pytest", "numpy"]
+test-command = "pytest {project}/tests/test_python_bindings.py -v"
+
+[tool.cibuildwheel.linux]
+before-build = "pip install pybind11"
+
+[tool.cibuildwheel.macos]
+before-build = "pip install pybind11"
+
+[tool.cibuildwheel.windows]
+before-build = "pip install pybind11"

@@ -19,6 +19,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 7 | Multi-Model End-to-End Pipeline & Reference Matching | Complete |
 | 8 | Python Bridge (pybind11) | Complete |
 | 9 | Software-Level Parallelism (OpenMP & AVX2) | Complete |
+| 10 | Operator Fusion (GAT & GraphSAGE) | Complete |
 
 ---
 
@@ -30,6 +31,9 @@ TinyGNN/
 ├── setup.py                    # Phase 8: pybind11 Python extension build
 ├── benchmarks/
 │   ├── bench_parallel.cpp      # Phase 9: OpenMP + AVX2 thread-scaling benchmark
+│   ├── bench_fusion.cpp        # Phase 10: fused vs. unfused GAT/SAGE runtime + memory
+│   ├── massif_gat_fused.cpp    # Phase 10: Massif profiling (fused GAT heap)
+│   ├── massif_gat_unfused.cpp  # Phase 10: Massif profiling (unfused GAT heap)
 │   └── thread_scaling.png      # Phase 9: generated thread-scaling chart
 ├── include/
 │   └── tinygnn/
@@ -73,6 +77,7 @@ TinyGNN/
     ├── train_cora.py           # PyG training: GCN/SAGE/GAT → binary weight export
     ├── validate_cora.py        # Phase 8: PyG ↔ TinyGNN logit-level comparison
     ├── plot_scaling.py         # Phase 9: thread-scaling chart generator (matplotlib)
+    ├── run_massif_phase9.sh    # Phase 10: Massif memory profiling (fused vs unfused)
     ├── build_python.py         # Phase 8: build Python extension + run tests
     ├── sanitizers.sh           # ASan + UBSan (27 configs, all phases)
     └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all phases)
@@ -183,6 +188,21 @@ g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Iinclude \
 
 # Generate thread-scaling chart (requires matplotlib)
 python3 scripts/plot_scaling.py --csv build/bench/results.csv
+```
+
+# Phase 10 -- Operator Fusion Benchmark
+```bash
+# Build fusion benchmark
+g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Iinclude \
+    -o bench_fusion benchmarks/bench_fusion.cpp \
+    src/tensor.cpp src/graph_loader.cpp src/ops.cpp \
+    src/layers.cpp src/model.cpp
+
+# Run (fused vs. unfused runtime + memory analysis)
+OMP_NUM_THREADS=8 ./bench_fusion
+
+# Massif memory profiling (requires Valgrind)
+bash scripts/run_massif_phase9.sh
 ```
 
 ### Memory safety (WSL / Linux)
@@ -1106,6 +1126,95 @@ Key observations:
 
 ---
 
+## Phase 10 -- Operator Fusion (GAT & GraphSAGE)
+
+### Goal
+Fuse multi-step GNN layer operations into single row-wise loops, eliminating intermediate tensor allocations and reducing peak memory consumption while improving runtime through better data locality.
+
+### Design
+
+#### GAT Fusion: SpSDDMM + edge_softmax + SpMM
+
+The unfused GAT forward pass allocates three nnz-sized intermediate tensors:
+
+| Step | Operation | Intermediate | Size |
+|------|-----------|-------------|------|
+| 3 | SpSDDMM | `edge_logits` vector | nnz × 4 bytes |
+| 3 | Build CSR | `attn_csr` (rp + ci + vals copies) | (N+1)×4 + 2×nnz×4 bytes |
+| 4 | edge_softmax | `alpha` CSR (another full copy) | (N+1)×4 + 2×nnz×4 bytes |
+
+The **fused kernel** replaces Steps 3–5 with a single row-wise loop:
+
+```cpp
+for each node i:                                    // parallelized with OpenMP
+    for j ∈ N(i):
+        e_ij = LeakyReLU(src_score[i] + dst_score[j])   // SpSDDMM
+    α = softmax(e_row)                                    // edge_softmax
+    out[i] = Σ_j α_ij · Wh[j]                            // SpMM (AVX2 FMA)
+```
+
+This eliminates **~7 × nnz bytes** of intermediate allocations, replacing them with a single per-row buffer of size max_degree × 4 bytes.
+
+#### SAGE Fusion: Aggregation + Dual-Matmul
+
+The unfused SAGE forward allocates:
+
+| Step | Operation | Intermediate | Size |
+|------|-----------|-------------|------|
+| 1 | spmm(A, H) | `agg` tensor | N × F_in × 4 bytes |
+| 2 | matmul(agg, W_neigh) | `h_neigh` tensor | N × F_out × 4 bytes |
+| 3 | matmul(H, W_self) | `h_self` tensor | N × F_out × 4 bytes |
+
+The **fused kernel** computes everything row-by-row:
+
+```cpp
+for each node i:                                    // parallelized with OpenMP
+    agg_row = mean({H[j] : j ∈ N(i)})                // AVX2 accumulate
+    out[i] = agg_row · W_neigh + H[i] · W_self       // dual-matmul (AVX2 FMA)
+```
+
+This eliminates the **N × F_in** aggregation tensor and the **N × F_out** h_self tensor, needing only an F_in-sized per-row buffer.
+
+### Benchmark Results
+
+Tested on Intel Core 9 270H (8 threads), GCC 13.3, Ubuntu 24.04 (WSL2):
+
+#### GAT: Fused SpSDDMM + edge_softmax + SpMM
+
+| Configuration | Unfused | Fused | Speedup | Memory Ratio |
+|--------------|---------|-------|---------|-------------|
+| Cora-like (2708×1433→8, deg≈5) | 4,867 µs | 5,391 µs | 0.90× | 2.8× |
+| Medium (5000×128→64, deg≈10) | 4,211 µs | 3,129 µs | 1.35× | 1.4× |
+| Large (10000×64→32, deg≈20) | 5,717 µs | 3,534 µs | **1.62×** | **2.6×** |
+| XL (20000×32→16, deg≈30) | 12,323 µs | 4,726 µs | **2.61×** | **5.6×** |
+
+#### SAGE: Fused Aggregation + Dual-Matmul
+
+| Configuration | Unfused | Fused | Speedup | Memory Ratio |
+|--------------|---------|-------|---------|-------------|
+| Cora-like (2708×1433→128, deg≈5) | 60,259 µs | 20,209 µs | **2.98×** | **13.1×** |
+| Medium (5000×128→64, deg≈10) | 6,107 µs | 1,858 µs | **3.29×** | 4.0× |
+| Large (10000×64→32, deg≈20) | 5,631 µs | 3,293 µs | 1.71× | 4.0× |
+| XL (20000×128→64, deg≈30) | 30,015 µs | 18,246 µs | 1.64× | 4.0× |
+
+Key observations:
+- **GAT fusion scales with graph density** — at deg≈30, the nnz-sized intermediates dominate and fusion saves 5.6× memory with 2.61× speedup
+- **SAGE fusion excels when F_in is large** — Cora layer 1 (F_in=1433) shows 13.1× memory reduction and 2.98× speedup by avoiding the N×F_in aggregate tensor
+- Cora-like GAT is slightly slower (0.90×) because the per-row softmax buffer allocation overhead dominates for very small neighborhoods (deg≈5)
+
+### Valgrind Massif Profiling
+
+Massif heap profiling on GAT (N=10000, F_in=64, F_out=32, deg≈20, nnz≈210K):
+
+| Variant | Peak Heap | Savings |
+|---------|-----------|---------|
+| Unfused | 10,857,004 bytes (10.35 MB) | — |
+| Fused | 7,420,824 bytes (7.08 MB) | **3.44 MB (31.6%)** |
+
+Run profiling: `bash scripts/run_massif_phase9.sh`
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -1150,3 +1259,4 @@ All seven phases pass the full sanitizer matrix with zero errors:
 - **Sparse-native message passing** -- SpMM walks the CSR structure directly (row_ptr → col_ind → accumulate), avoiding any sparse-to-dense conversion
 - **In-place activations** -- all 8 activation functions modify tensors in-place with O(1) extra memory, avoiding unnecessary allocations in GNN inference pipelines
 - **Numerical stability** -- softmax/log-softmax use the max-subtraction trick; sigmoid uses a two-branch formula to prevent overflow for extreme inputs
+- **Operator fusion** -- GAT fuses SpSDDMM + edge_softmax + SpMM into a single row-wise loop (eliminating nnz-sized intermediate CSR tensors); SAGE fuses aggregation + dual-matmul (eliminating N×F_in intermediate)

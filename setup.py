@@ -100,12 +100,14 @@ ext_modules = [
 setup(
     name="tinygnn",
     version="0.1.0",
-    author="Jai Ansh Bindra",
-    description="TinyGNN — Zero-dependency GNN inference engine with Python bindings",
+    author="Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)",
+    description="TinyGNN — Zero-dependency C++17 GNN inference engine with Python bindings",
     long_description=open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
     if os.path.exists(os.path.join(ROOT, "README.md"))
     else "",
     long_description_content_type="text/markdown",
+    url="https://github.com/JaiAnshSB/TinyGNN",
+    license="MIT",
     packages=["tinygnn"],
     package_dir={"tinygnn": os.path.join("python", "tinygnn")},
     ext_modules=ext_modules,

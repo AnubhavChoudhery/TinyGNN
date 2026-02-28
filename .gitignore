@@ -66,3 +66,10 @@ python/tinygnn/*.pyc
 #Python virtual environments
 venv/
 .venv/
+
+# Documentation build output (Doxygen + Sphinx)
+docs/doxygen/
+docs/_build/
+
+# GitHub Actions local testing
+.act/

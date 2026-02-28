@@ -20,6 +20,7 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 | 8 | Python Bridge (pybind11) | Complete |
 | 9 | Software-Level Parallelism (OpenMP & AVX2) | Complete |
 | 10 | Operator Fusion (GAT & GraphSAGE) | Complete |
+| 11 | Packaging, CI/CD & Documentation | Complete |
 
 ---
 
@@ -28,7 +29,25 @@ TinyGNN pivots from a dense-only deep learning runtime to a **sparse-native arch
 ```
 TinyGNN/
 ├── CMakeLists.txt
-├── setup.py                    # Phase 8: pybind11 Python extension build
+├── setup.py                    # pybind11 Python extension build
+├── pyproject.toml              # Phase 11: PEP 517/518 packaging metadata (PyPI)
+├── MANIFEST.in                 # Phase 11: source distribution manifest
+├── LICENSE                     # Phase 11: MIT license
+├── CITATION.cff                # Phase 11: JOSS/JMLR citation metadata
+├── CONTRIBUTING.md             # Phase 11: contributor guidelines
+├── Doxyfile                    # Phase 11: Doxygen C++ documentation config
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # Phase 11: GitHub Actions CI/CD pipeline
+├── docs/                       # Phase 11: Sphinx documentation
+│   ├── conf.py                 # Sphinx configuration
+│   ├── index.rst               # Documentation home page
+│   ├── installation.rst        # Installation guide
+│   ├── quickstart.rst          # Quick start tutorial
+│   ├── python_api.rst          # Python API reference
+│   ├── cpp_api.rst             # C++ API reference (Breathe + Doxygen)
+│   ├── benchmarks.rst          # Benchmark results
+│   └── Makefile                # Sphinx build helper
 ├── benchmarks/
 │   ├── bench_parallel.cpp      # Phase 9: OpenMP + AVX2 thread-scaling benchmark
 │   ├── bench_fusion.cpp        # Phase 10: fused vs. unfused GAT/SAGE runtime + memory
@@ -75,141 +94,124 @@ TinyGNN/
     ├── install_wsl_tools.sh    # one-time WSL tooling setup
     ├── fetch_datasets.py       # download Cora + Reddit, convert to CSV
     ├── train_cora.py           # PyG training: GCN/SAGE/GAT → binary weight export
-    ├── validate_cora.py        # Phase 8: PyG ↔ TinyGNN logit-level comparison
-    ├── plot_scaling.py         # Phase 9: thread-scaling chart generator (matplotlib)
-    ├── run_massif_phase9.sh    # Phase 10: Massif memory profiling (fused vs unfused)
-    ├── build_python.py         # Phase 8: build Python extension + run tests
+    ├── validate_cora.py        # PyG ↔ TinyGNN logit-level comparison
+    ├── plot_scaling.py         # thread-scaling chart generator (matplotlib)
+    ├── run_massif_phase9.sh    # Massif memory profiling (fused vs unfused)
+    ├── build_python.py         # build Python extension + run tests
     ├── sanitizers.sh           # ASan + UBSan (27 configs, all phases)
     └── valgrind_all.sh         # Memcheck + Helgrind + Callgrind (all phases)
 ```
 
 ---
 
-## Building
+## Installation
 
-### Prerequisites
+### Quick Install (PyPI)
+
+The simplest way to install TinyGNN:
+
+```bash
+pip install tinygnn
+```
+
+### Install from Source (Development)
+
+```bash
+git clone https://github.com/JaiAnshSB/TinyGNN.git
+cd TinyGNN
+pip install -e ".[dev]"
+```
+
+This builds the C++ extension in-place and installs development dependencies.
+
+### Python Usage
+
+```python
+import tinygnn
+import numpy as np
+
+# Create tensors from NumPy
+X = tinygnn.Tensor.from_numpy(np.random.randn(10, 16).astype(np.float32))
+print(f"Shape: {X.rows} x {X.cols}")  # 10 x 16
+
+# Build a GCN model
+model = tinygnn.Model()
+model.add_gcn_layer(1433, 64, activation=tinygnn.Activation.RELU)
+model.add_gcn_layer(64, 7, activation=tinygnn.Activation.NONE)
+model.load_weights("weights/gcn_cora.bin")
+
+# Run inference
+cora = tinygnn.load_cora_binary("weights/cora_graph.bin")
+logits = model.forward(cora.adjacency, cora.features)
+predictions = logits.to_numpy().argmax(axis=1)
+print(f"Predicted classes: {np.unique(predictions)}")
+```
+
+### C++ Only (No Python)
+
+#### Prerequisites
 - C++17-capable compiler (GCC 8+, Clang 7+, MSVC 2019+)
 - CMake 3.16+  *(optional -- g++ directly also works)*
-- OpenMP (usually bundled with GCC; optional but recommended for Phase 9 parallelism)
+- OpenMP (usually bundled with GCC; optional but recommended for parallelism)
 - CPU with AVX2 + FMA support (Intel Haswell+ / AMD Zen+; optional, scalar fallback provided)
 
-### With CMake
+#### With CMake
 ```bash
-cmake -S . -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
+ctest --test-dir build --output-on-failure --config Release
 ```
 
-### Directly with g++
+#### Directly with g++ (example)
 ```bash
-# Phase 1 -- Tensor
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp tests/test_tensor.cpp \
-    -o build/test_tensor && ./build/test_tensor
-
-# Phase 2 -- Graph Data Loader
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/graph_loader.cpp tests/test_graph_loader.cpp \
-    -o build/test_graph_loader && ./build/test_graph_loader
-
-# Phase 3 -- Dense GEMM
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp tests/test_matmul.cpp \
-    -o build/test_matmul && ./build/test_matmul
-
-# Phase 4 -- Sparse-Dense SpMM
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp tests/test_spmm.cpp \
-    -o build/test_spmm && ./build/test_spmm
-
-# Phase 5 -- Activations & Utilities
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp tests/test_activations.cpp \
-    -o build/test_activations && ./build/test_activations
-```
-
-# Phase 6 -- GCN, GraphSAGE, GAT Layers
-```bash
-# Phase 6a -- GCN Layer
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_gcn.cpp \
-    -o build/test_run/test_gcn && ./build/test_run/test_gcn
-
-# Phase 6b -- GraphSAGE Layer
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_graphsage.cpp \
-    -o build/test_run/test_graphsage && ./build/test_run/test_graphsage
-
-# Phase 6c -- GAT Layer
-g++ -std=c++17 -Wall -Wextra -I include \
-    src/tensor.cpp src/ops.cpp src/layers.cpp tests/test_gat.cpp \
-    -o build/test_run/test_gat && ./build/test_run/test_gat
-```
-
-# Phase 7 -- End-to-End Pipeline
-```bash
-# Step 1: Train models in PyG & export weights (requires PyTorch + PyG)
-source /home/<user>/tinygnn_venv/bin/activate
-python3 scripts/train_cora.py
-
-# Step 2: Run C++ inference tests
-g++ -std=c++17 -Wall -Wextra -I include \
+# All tests at once (with OpenMP + AVX2)
+g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Wall -Wextra -I include \
     src/tensor.cpp src/graph_loader.cpp src/ops.cpp src/layers.cpp src/model.cpp \
-    tests/test_e2e.cpp -o build/test_e2e && ./build/test_e2e
+    tests/test_tensor.cpp -o build/test_tensor && ./build/test_tensor
 ```
 
-# Phase 8 -- Python Bridge (pybind11)
+### Python Extension
 ```bash
-# Install dependencies
-pip install pybind11 numpy scipy pytest
-
-# Build the Python extension (MinGW on Windows)
-python setup.py build_ext --inplace --compiler=mingw32
-
-# Or use the build helper script
-python scripts/build_python.py
-
-# Run Python binding tests (49 tests)
-python -m pytest tests/test_python_bindings.py -v
-
-# Run Cora validation (logit-level comparison with PyG)
-python scripts/validate_cora.py --logit-check
+pip install -e ".[dev]"                                   # development install
+python -m pytest tests/test_python_bindings.py -v         # run Python tests
+python scripts/validate_cora.py --logit-check             # PyG logit comparison
 ```
 
-# Phase 9 -- Parallel Benchmark (OpenMP + AVX2)
+### Benchmarks
 ```bash
-# Build with OpenMP + AVX2
-g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Iinclude \
-    src/tensor.cpp src/ops.cpp benchmarks/bench_parallel.cpp \
-    -o build/bench/bench_parallel
+# Thread-scaling (OpenMP + AVX2)
+cmake --build build --target bench_parallel && ./build/bench_parallel
 
-# Run benchmark (outputs CSV + console table)
-./build/bench/bench_parallel --csv build/bench/results.csv
+# Operator fusion (fused vs unfused GAT/SAGE)
+cmake --build build --target bench_fusion && OMP_NUM_THREADS=8 ./build/bench_fusion
 
-# Generate thread-scaling chart (requires matplotlib)
-python3 scripts/plot_scaling.py --csv build/bench/results.csv
-```
-
-# Phase 10 -- Operator Fusion Benchmark
-```bash
-# Build fusion benchmark
-g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Iinclude \
-    -o bench_fusion benchmarks/bench_fusion.cpp \
-    src/tensor.cpp src/graph_loader.cpp src/ops.cpp \
-    src/layers.cpp src/model.cpp
-
-# Run (fused vs. unfused runtime + memory analysis)
-OMP_NUM_THREADS=8 ./bench_fusion
-
-# Massif memory profiling (requires Valgrind)
+# Massif memory profiling (requires Valgrind on Linux)
 bash scripts/run_massif_phase9.sh
 ```
 
-### Memory safety (WSL / Linux)
+### Memory Safety (WSL / Linux)
 ```bash
 bash scripts/sanitizers.sh       # 27 sanitizer configs across all phases
 bash scripts/valgrind_all.sh     # Memcheck + Helgrind + Callgrind
 ```
+
+### Building Documentation
+```bash
+# C++ API docs (Doxygen)
+doxygen Doxyfile                 # → docs/doxygen/html/index.html
+
+# Python docs (Sphinx)
+pip install sphinx sphinx-rtd-theme breathe
+cd docs && make html             # → docs/_build/html/index.html
+```
+
+### CI/CD
+
+Every push to `main` and every pull request automatically triggers GitHub Actions:
+- **C++ build + test** on Linux (GCC + Clang), macOS, and Windows (MSVC)
+- **Python build + test** on Linux, macOS, Windows (Python 3.10 + 3.12)
+- **ASan + UBSan** sanitizer checks on Linux
+- **Documentation build** (Doxygen + Sphinx)
 
 ---
 
@@ -1215,6 +1217,64 @@ Run profiling: `bash scripts/run_massif_phase9.sh`
 
 ---
 
+## Phase 11 -- Packaging, CI/CD & Documentation
+
+### Goal
+Make TinyGNN a "one-click install" package ready for JMLR MLOSS or JOSS submission, with professional CI/CD, comprehensive documentation, and PyPI packaging.
+
+### PyPI Packaging
+
+TinyGNN ships as a standard Python package with a pybind11 C++ extension:
+
+```bash
+pip install tinygnn
+```
+
+**Package structure:**
+- `pyproject.toml` — PEP 517/518 metadata (name, version, authors, classifiers, dependencies)
+- `setup.py` — Extension build configuration (C++17 flags, OpenMP, AVX2, MinGW/MSVC/GCC support)
+- `MANIFEST.in` — Source distribution manifest (ensures headers, sources, docs are included)
+- `LICENSE` — MIT License
+- `CITATION.cff` — Machine-readable citation metadata for JOSS/JMLR
+
+**Classifiers:**
+- `Development Status :: 4 - Beta`
+- `Topic :: Scientific/Engineering :: Artificial Intelligence`
+- `License :: OSI Approved :: MIT License`
+- Python 3.8–3.13 support
+
+### CI/CD (GitHub Actions)
+
+Every push to `main` and every PR triggers 4 parallel jobs:
+
+| Job | Platform | What it does |
+|-----|----------|-------------|
+| **C++ Build + Test** | Ubuntu (GCC + Clang), macOS, Windows (MSVC) | CMake build → CTest (18,000+ assertions) |
+| **Python Build + Test** | Ubuntu (3.10, 3.12), macOS (3.12), Windows (3.12) | pip install → pytest (49 tests) |
+| **Sanitizers** | Ubuntu (GCC) | ASan + UBSan + leak detection on all C++ tests |
+| **Documentation** | Ubuntu | Doxygen (C++) + Sphinx (Python) → artifact upload |
+
+### Documentation
+
+**C++ API (Doxygen)**:
+- Configured via `Doxyfile` in project root
+- Extracts from annotated headers in `include/tinygnn/`
+- Generates HTML + XML (for Breathe cross-reference)
+- Class diagrams, include graphs (via Graphviz)
+- Build: `doxygen Doxyfile` → `docs/doxygen/html/`
+
+**Python API (Sphinx)**:
+- Read the Docs theme (`sphinx-rtd-theme`)
+- Cross-references C++ docs via Breathe bridge
+- Pages: Installation, Quick Start, Python API, C++ API, Benchmarks, Contributing
+- Build: `cd docs && make html` → `docs/_build/html/`
+
+### Authors
+
+**Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)**
+
+---
+
 ## Cumulative Test Statistics
 
 | Phase | Test file | Functions | Assertions | Result |
@@ -1260,3 +1320,4 @@ All seven phases pass the full sanitizer matrix with zero errors:
 - **In-place activations** -- all 8 activation functions modify tensors in-place with O(1) extra memory, avoiding unnecessary allocations in GNN inference pipelines
 - **Numerical stability** -- softmax/log-softmax use the max-subtraction trick; sigmoid uses a two-branch formula to prevent overflow for extreme inputs
 - **Operator fusion** -- GAT fuses SpSDDMM + edge_softmax + SpMM into a single row-wise loop (eliminating nnz-sized intermediate CSR tensors); SAGE fuses aggregation + dual-matmul (eliminating N×F_in intermediate)
+- **One-click install** -- `pip install tinygnn` builds the C++ extension, links statically, and ships a clean Python package; GitHub Actions CI/CD validates every commit across 4 platforms

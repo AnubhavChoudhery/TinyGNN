@@ -23,7 +23,7 @@ SRCS_GCN="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers
 SRCS_GRAPHSAGE="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_graphsage.cpp"
 SRCS_GAT="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/tests/test_gat.cpp"
 SRCS_E2E="$PROJ_ROOT/src/tensor.cpp $PROJ_ROOT/src/graph_loader.cpp $PROJ_ROOT/src/ops.cpp $PROJ_ROOT/src/layers.cpp $PROJ_ROOT/src/model.cpp $PROJ_ROOT/tests/test_e2e.cpp"
-CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer"
+CXXFLAGS="-std=c++17 -g -O1 -fno-omit-frame-pointer -fopenmp -mavx2 -mfma"
 
 mkdir -p "$BUILD_DIR"
 

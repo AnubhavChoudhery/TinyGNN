@@ -1,6 +1,13 @@
 // ============================================================================
-//  TinyGNN — Compute Kernels & Activations  (Phase 3 + Phase 4 + Phase 5)
+//  TinyGNN — Compute Kernels & Activations  (Phase 3–5 + Phase 8 parallelism)
 //  src/ops.cpp
+//
+//  Phase 8 additions:
+//    • OpenMP  — #pragma omp parallel for on outer (row) loops of matmul,
+//                spmm, softmax, log_softmax, add_bias, and element-wise
+//                activations.
+//    • AVX2   — _mm256 FMA intrinsics on the inner feature-dimension loops
+//                of matmul and spmm for 8-wide SIMD throughput.
 // ============================================================================
 
 #include "tinygnn/ops.hpp"
@@ -9,6 +16,16 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+
+// ── SIMD headers (Phase 8) ──────────────────────────────────────────────────
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+// ── OpenMP (Phase 8) ────────────────────────────────────────────────────────
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace tinygnn {
 
@@ -87,25 +104,35 @@ Tensor matmul(const Tensor& A, const Tensor& B) {
 
     // ── Core GEMM: loop order (i, k, j) ─────────────────────────────────────
     //
-    //  Outer loop  i ∈ [0, M):   one row of A → one row of C
-    //  Middle loop k ∈ [0, K):   shared dimension
-    //    Load A[i][k] once into scalar register a_ik.
-    //    Inner loop  j ∈ [0, N):   one row of B, one element of C
-    //      C[i][j] += A[i][k] * B[k][j]
+    //  Phase 8: outer i-loop is parallelised with OpenMP.
+    //  Inner j-loop uses AVX2 FMA intrinsics (8 floats per cycle).
     //
-    //  The compiler can auto-vectorise the inner j-loop because:
-    //    • a_ik is a loop-invariant scalar
-    //    • b[k*N + j] and c[i*N + j] are contiguous in memory
-    //    • __restrict__ informs the compiler there is no aliasing
-    //
+    #pragma omp parallel for schedule(dynamic)
     for (std::size_t i = 0; i < M; ++i) {
         for (std::size_t k = 0; k < K; ++k) {
-            const float a_ik = a[i * K + k];   // hoist A[i][k] into register
+            const float a_ik = a[i * K + k];
+            float* __restrict__ ci = c + i * N;
+            const float* __restrict__ bk = b + k * N;
 
-            // Inner j-loop: compiler-vectorisable with -O2 / -O3
-            for (std::size_t j = 0; j < N; ++j) {
-                c[i * N + j] += a_ik * b[k * N + j];
+#ifdef __AVX2__
+            // AVX2 path: 8-wide FMA
+            const __m256 va = _mm256_set1_ps(a_ik);
+            std::size_t j = 0;
+            for (; j + 8 <= N; j += 8) {
+                __m256 vc = _mm256_loadu_ps(ci + j);
+                __m256 vb = _mm256_loadu_ps(bk + j);
+                vc = _mm256_fmadd_ps(va, vb, vc);
+                _mm256_storeu_ps(ci + j, vc);
             }
+            // Scalar tail
+            for (; j < N; ++j) {
+                ci[j] += a_ik * bk[j];
+            }
+#else
+            for (std::size_t j = 0; j < N; ++j) {
+                ci[j] += a_ik * bk[j];
+            }
+#endif
         }
     }
 
@@ -195,29 +222,38 @@ Tensor spmm(const Tensor& A, const Tensor& B) {
 
     // ── Core CSR-SpMM ────────────────────────────────────────────────────────
     //
-    //  Outer loop  i ∈ [0, M):      one row of A → one row of C (one node)
-    //  Middle loop nz ∈ [rp[i], rp[i+1]):  non-zeros in row i (neighbors)
-    //    k    = ci[nz]             column index (neighbor node ID)
-    //    a_val = av[nz]            edge weight (1.0 for unweighted graphs)
-    //    Inner loop  j ∈ [0, N):   feature dimension
-    //      C[i][j] += a_val * B[k][j]
+    //  Phase 8: outer i-loop parallelised with OpenMP (schedule(dynamic)
+    //  because row lengths vary widely in power-law graphs).
+    //  Inner j-loop uses AVX2 FMA intrinsics.
     //
-    //  The inner j-loop is vectorisable: a_val is a scalar constant,
-    //  b[k*N + j] and c[i*N + j] are contiguous in memory.
-    //
+    #pragma omp parallel for schedule(dynamic)
     for (std::size_t i = 0; i < M; ++i) {
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
+        float* __restrict__ crow = c + i * N;
 
         for (int32_t nz = row_start; nz < row_end; ++nz) {
             const auto k     = static_cast<std::size_t>(ci[nz]);
             const float a_val = av[nz];
+            const float* __restrict__ brow = b + k * N;
 
-            // Accumulate a_val * B[k, :] into C[i, :]
-            // Compiler can auto-vectorise this with -O2 / -O3
-            for (std::size_t j = 0; j < N; ++j) {
-                c[i * N + j] += a_val * b[k * N + j];
+#ifdef __AVX2__
+            const __m256 va = _mm256_set1_ps(a_val);
+            std::size_t j = 0;
+            for (; j + 8 <= N; j += 8) {
+                __m256 vc = _mm256_loadu_ps(crow + j);
+                __m256 vb = _mm256_loadu_ps(brow + j);
+                vc = _mm256_fmadd_ps(va, vb, vc);
+                _mm256_storeu_ps(crow + j, vc);
             }
+            for (; j < N; ++j) {
+                crow[j] += a_val * brow[j];
+            }
+#else
+            for (std::size_t j = 0; j < N; ++j) {
+                crow[j] += a_val * brow[j];
+            }
+#endif
         }
     }
 
@@ -259,8 +295,8 @@ void relu_inplace(Tensor& X) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
-        // std::max typically lowers to a single MAX instruction (no branch)
         d[i] = std::max(0.0f, d[i]);
     }
 }
@@ -286,8 +322,8 @@ void leaky_relu_inplace(Tensor& X, float alpha) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
-        // Ternary enables CMOV / branchless vectorisation (both sides are cheap)
         d[i] = d[i] >= 0.0f ? d[i] : alpha * d[i];
     }
 }
@@ -311,6 +347,7 @@ void elu_inplace(Tensor& X, float alpha) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
         if (d[i] < 0.0f) {
             d[i] = alpha * (std::exp(d[i]) - 1.0f);
@@ -341,6 +378,7 @@ void sigmoid_inplace(Tensor& X) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
         if (d[i] >= 0.0f) {
             d[i] = 1.0f / (1.0f + std::exp(-d[i]));
@@ -370,6 +408,7 @@ void tanh_inplace(Tensor& X) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
         d[i] = std::tanh(d[i]);
     }
@@ -397,10 +436,10 @@ void gelu_inplace(Tensor& X) {
     float* __restrict__ d = X.data().data();
     const std::size_t n = X.data().size();
 
-    // sqrt(2/π) ≈ 0.7978845608
     constexpr float SQRT_2_OVER_PI = 0.7978845608f;
     constexpr float COEFF          = 0.044715f;
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < n; ++i) {
         const float x = d[i];
         const float inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
@@ -444,6 +483,8 @@ void softmax_inplace(Tensor& X) {
 
     float* __restrict__ d = X.data().data();
 
+    // Phase 8: parallelize over rows — each row is independent
+    #pragma omp parallel for schedule(dynamic)
     for (std::size_t i = 0; i < M; ++i) {
         float* row = d + i * N;
 
@@ -501,6 +542,8 @@ void log_softmax_inplace(Tensor& X) {
 
     float* __restrict__ d = X.data().data();
 
+    // Phase 8: parallelize over rows — each row is independent
+    #pragma omp parallel for schedule(dynamic)
     for (std::size_t i = 0; i < M; ++i) {
         float* row = d + i * N;
 
@@ -562,6 +605,7 @@ void add_bias(Tensor& X, const Tensor& bias) {
     float*       __restrict__ x = X.data().data();
     const float* __restrict__ b = bias.data().data();
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < M; ++i) {
         for (std::size_t j = 0; j < N; ++j) {
             x[i * N + j] += b[j];

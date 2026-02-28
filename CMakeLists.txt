@@ -86,3 +86,7 @@ add_test(NAME E2ETests COMMAND test_e2e)
 # ── Benchmark (Phase 8) ────────────────────────────────────────────────────
 add_executable(bench_parallel benchmarks/bench_parallel.cpp)
 target_link_libraries(bench_parallel PRIVATE tinygnn_core)
+
+# ── Benchmark (Phase 9: Operator Fusion) ──────────────────────────────────
+add_executable(bench_fusion benchmarks/bench_fusion.cpp)
+target_link_libraries(bench_fusion PRIVATE tinygnn_core)

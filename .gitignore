@@ -42,8 +42,10 @@ tinygnn_reddit_*
 # Valgrind / sanitizer artifacts
 build/valgrind/
 build/sanitizers/
+build/massif/
 *.log
 callgrind.out*
+massif.out*
 
 # Benchmark outputs (regenerate via: build/bench/bench_parallel)
 build/bench/

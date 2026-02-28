@@ -1,5 +1,5 @@
 // ============================================================================
-//  TinyGNN — GNN Layer Implementations  (Phase 6)
+//  TinyGNN — GNN Layer Implementations  (Phase 6 + Phase 9 Operator Fusion)
 //  src/layers.cpp
 //
 //  Implements:
@@ -7,7 +7,11 @@
 //    • gcn_norm         — D̃^{-1/2} Ã D̃^{-1/2}
 //    • GCNLayer         — GCN forward pass (Kipf & Welling, 2017)
 //    • SAGELayer        — GraphSAGE forward pass (Hamilton et al., 2017)
+//      Phase 9: Fused aggregation + dual-matmul (eliminates N×F_in AGG tensor)
 //    • sage_max_aggregate — element-wise max pooling over neighbors
+//    • GATLayer         — GAT forward pass (Veličković et al., 2018)
+//      Phase 9: Fused SpSDDMM + edge_softmax + SpMM (eliminates nnz-sized CSRs)
+//    • edge_softmax     — sparse row-wise softmax (standalone utility)
 // ============================================================================
 
 #include "tinygnn/layers.hpp"
@@ -21,6 +25,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// ── SIMD headers (Phase 9: Operator Fusion) ─────────────────────────────────
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+// ── OpenMP (Phase 9) ────────────────────────────────────────────────────────
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace tinygnn {
 
@@ -476,18 +490,20 @@ void SAGELayer::set_bias(Tensor b) {
 }
 
 // ============================================================================
-//  SAGELayer — forward
+//  SAGELayer — forward  (Phase 9: Fused aggregation + dual-matmul)
 // ============================================================================
 //
 //  h_v' = σ( W_neigh · AGG({h_u : u ∈ N(v)}) + W_self · h_v + b )
 //
-//  Steps:
-//    1. Compute AGG (mean or max aggregation)
-//    2. h_neigh = matmul(AGG, W_neigh)      — transform aggregated features
-//    3. h_self  = matmul(H, W_self)          — transform self features
-//    4. out = h_neigh + h_self               — combine (element-wise add)
-//    5. add_bias(out, bias)                  — optional
-//    6. activation(out)                      — in-place
+//  Fused implementation (Phase 9):
+//    For each node i in parallel:
+//      1. agg_row[f] = AGG({H[j][f] : j ∈ N(i)})  (F_in temporary per row)
+//      2. out[i] = agg_row · W_neigh + H[i] · W_self  (dual-matmul, AVX2 FMA)
+//      3. out[i] += bias  (optional)
+//      4. activation(out[i])
+//
+//  This eliminates the N×F_in intermediate AGG tensor and the N×F_out
+//  h_self tensor vs. the original Phase 6 implementation.
 //
 // ============================================================================
 Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
@@ -514,62 +530,179 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
             ") != H.rows() (" + std::to_string(H.rows()) + ").");
     }
 
-    const std::size_t N = H.rows();
+    const std::size_t N     = H.rows();
+    const std::size_t F_in  = in_features_;
+    const std::size_t F_out = out_features_;
+    const auto& rp = A.row_ptr();
+    const auto& ci = A.col_ind();
 
-    // ── Step 1: Aggregation ──────────────────────────────────────────────────
-    Tensor agg;
+    const float* h_data  = H.data().data();
+    const float* wn_data = weight_neigh_.data().data();
+    const float* ws_data = weight_self_.data().data();
+
+    // ── Fused aggregation + dual-matmul (Phase 9: Operator Fusion) ──────────
+    //
+    //  Eliminates the N×F_in intermediate AGG tensor and the N×F_out
+    //  h_self tensor by computing everything row-by-row:
+    //
+    //  For each node i:
+    //    1. agg_row[f] = AGG({H[j][f] : j ∈ N(i)})      (F_in temporary)
+    //    2. out[i] = agg_row · W_neigh + H[i] · W_self   (fused matmul)
+    //
+    //  Memory saved: N×F_in + N×F_out floats.
+    //
+    Tensor out = Tensor::dense(N, F_out);
+    float* out_data = out.data().data();
 
     switch (aggregator_) {
         case Aggregator::Mean: {
-            // Mean aggregation: spmm(A, H) then divide by degree
-            agg = spmm(A, H);   // (N × F_in) — sum of neighbors
-
-            // Compute degree per row and divide
-            const auto& rp = A.row_ptr();
-            float* agg_d   = agg.data().data();
-            const std::size_t F = H.cols();
-
+            #pragma omp parallel for schedule(dynamic)
             for (std::size_t i = 0; i < N; ++i) {
-                const float deg = static_cast<float>(rp[i + 1] - rp[i]);
+                const int32_t row_start = rp[i];
+                const int32_t row_end   = rp[i + 1];
+                const float deg = static_cast<float>(row_end - row_start);
+
+                // Per-row aggregation buffer (lives on each thread's stack)
+                std::vector<float> agg_row(F_in, 0.0f);
+
+                // Accumulate neighbor features
+                for (int32_t nz = row_start; nz < row_end; ++nz) {
+                    const auto j = static_cast<std::size_t>(ci[nz]);
+                    const float* hj = h_data + j * F_in;
+#ifdef __AVX2__
+                    std::size_t f = 0;
+                    for (; f + 8 <= F_in; f += 8) {
+                        __m256 va = _mm256_loadu_ps(agg_row.data() + f);
+                        __m256 vh = _mm256_loadu_ps(hj + f);
+                        _mm256_storeu_ps(agg_row.data() + f,
+                                         _mm256_add_ps(va, vh));
+                    }
+                    for (; f < F_in; ++f) agg_row[f] += hj[f];
+#else
+                    for (std::size_t f = 0; f < F_in; ++f) {
+                        agg_row[f] += hj[f];
+                    }
+#endif
+                }
+
+                // Degree-normalize
                 if (deg > 0.0f) {
                     const float inv_deg = 1.0f / deg;
-                    float* row = agg_d + i * F;
-                    for (std::size_t f = 0; f < F; ++f) {
-                        row[f] *= inv_deg;
+#ifdef __AVX2__
+                    const __m256 vinv = _mm256_set1_ps(inv_deg);
+                    std::size_t f = 0;
+                    for (; f + 8 <= F_in; f += 8) {
+                        __m256 va = _mm256_loadu_ps(agg_row.data() + f);
+                        _mm256_storeu_ps(agg_row.data() + f,
+                                         _mm256_mul_ps(va, vinv));
                     }
+                    for (; f < F_in; ++f) agg_row[f] *= inv_deg;
+#else
+                    for (std::size_t f = 0; f < F_in; ++f) {
+                        agg_row[f] *= inv_deg;
+                    }
+#endif
                 }
-                // deg == 0 → agg[i] stays 0 (from spmm zero-init)
+
+                // Fused dual-matmul: out[i] = agg_row · W_neigh + H[i] · W_self
+                float* out_i = out_data + i * F_out;
+                const float* hi = h_data + i * F_in;
+
+                for (std::size_t fi = 0; fi < F_in; ++fi) {
+                    const float a_val = agg_row[fi];
+                    const float h_val = hi[fi];
+                    const float* wn_row = wn_data + fi * F_out;
+                    const float* ws_row = ws_data + fi * F_out;
+#ifdef __AVX2__
+                    const __m256 va = _mm256_set1_ps(a_val);
+                    const __m256 vh = _mm256_set1_ps(h_val);
+                    std::size_t fo = 0;
+                    for (; fo + 8 <= F_out; fo += 8) {
+                        __m256 vo = _mm256_loadu_ps(out_i + fo);
+                        vo = _mm256_fmadd_ps(va,
+                                 _mm256_loadu_ps(wn_row + fo), vo);
+                        vo = _mm256_fmadd_ps(vh,
+                                 _mm256_loadu_ps(ws_row + fo), vo);
+                        _mm256_storeu_ps(out_i + fo, vo);
+                    }
+                    for (; fo < F_out; ++fo)
+                        out_i[fo] += a_val * wn_row[fo]
+                                   + h_val * ws_row[fo];
+#else
+                    for (std::size_t fo = 0; fo < F_out; ++fo) {
+                        out_i[fo] += a_val * wn_row[fo]
+                                   + h_val * ws_row[fo];
+                    }
+#endif
+                }
             }
             break;
         }
         case Aggregator::Max: {
-            agg = sage_max_aggregate(A, H);
+            constexpr float NEG_INF =
+                -std::numeric_limits<float>::infinity();
+
+            #pragma omp parallel for schedule(dynamic)
+            for (std::size_t i = 0; i < N; ++i) {
+                const int32_t row_start = rp[i];
+                const int32_t row_end   = rp[i + 1];
+
+                // Per-row max aggregation buffer
+                std::vector<float> agg_row(F_in, 0.0f);
+
+                if (row_start < row_end) {
+                    std::fill(agg_row.begin(), agg_row.end(), NEG_INF);
+                    for (int32_t nz = row_start; nz < row_end; ++nz) {
+                        const auto j = static_cast<std::size_t>(ci[nz]);
+                        const float* hj = h_data + j * F_in;
+                        for (std::size_t f = 0; f < F_in; ++f) {
+                            agg_row[f] = std::max(agg_row[f], hj[f]);
+                        }
+                    }
+                }
+
+                // Fused dual-matmul: out[i] = agg_row · W_neigh + H[i] · W_self
+                float* out_i = out_data + i * F_out;
+                const float* hi = h_data + i * F_in;
+
+                for (std::size_t fi = 0; fi < F_in; ++fi) {
+                    const float a_val = agg_row[fi];
+                    const float h_val = hi[fi];
+                    const float* wn_row = wn_data + fi * F_out;
+                    const float* ws_row = ws_data + fi * F_out;
+#ifdef __AVX2__
+                    const __m256 va = _mm256_set1_ps(a_val);
+                    const __m256 vh = _mm256_set1_ps(h_val);
+                    std::size_t fo = 0;
+                    for (; fo + 8 <= F_out; fo += 8) {
+                        __m256 vo = _mm256_loadu_ps(out_i + fo);
+                        vo = _mm256_fmadd_ps(va,
+                                 _mm256_loadu_ps(wn_row + fo), vo);
+                        vo = _mm256_fmadd_ps(vh,
+                                 _mm256_loadu_ps(ws_row + fo), vo);
+                        _mm256_storeu_ps(out_i + fo, vo);
+                    }
+                    for (; fo < F_out; ++fo)
+                        out_i[fo] += a_val * wn_row[fo]
+                                   + h_val * ws_row[fo];
+#else
+                    for (std::size_t fo = 0; fo < F_out; ++fo) {
+                        out_i[fo] += a_val * wn_row[fo]
+                                   + h_val * ws_row[fo];
+                    }
+#endif
+                }
+            }
             break;
         }
     }
 
-    // ── Step 2: Transform neighbor aggregation  h_neigh = AGG · W_neigh ─────
-    Tensor h_neigh = matmul(agg, weight_neigh_);
-
-    // ── Step 3: Transform self features  h_self = H · W_self ────────────────
-    Tensor h_self = matmul(H, weight_self_);
-
-    // ── Step 4: Combine  out = h_neigh + h_self  (element-wise addition) ────
-    const std::size_t total = N * out_features_;
-    float*       hn = h_neigh.data().data();
-    const float* hs = h_self.data().data();
-    for (std::size_t idx = 0; idx < total; ++idx) {
-        hn[idx] += hs[idx];
-    }
-    // h_neigh now holds the combined result; use it as `out`
-    Tensor& out = h_neigh;
-
-    // ── Step 5: Bias addition ────────────────────────────────────────────────
+    // ── Bias addition ────────────────────────────────────────────────────────
     if (use_bias_) {
         add_bias(out, bias_);
     }
 
-    // ── Step 6: Activation ───────────────────────────────────────────────────
+    // ── Activation ───────────────────────────────────────────────────────────
     switch (activation_) {
         case Activation::ReLU:
             relu_inplace(out);
@@ -752,20 +885,22 @@ void GATLayer::set_bias(Tensor b) {
 }
 
 // ============================================================================
-//  GATLayer — forward
+//  GATLayer — forward  (Phase 9: Fused SpSDDMM + edge_softmax + SpMM)
 // ============================================================================
 //
 //  Complete GAT forward pass (single attention head):
 //
-//    1. Wh = matmul(H, W)                        [N × F_out]
-//    2. src_scores[i] = Σ_f  a_l[f] * Wh[i][f]   (dot product per node)
-//       dst_scores[j] = Σ_f  a_r[f] * Wh[j][f]
-//    3. For each edge (i,j) in CSR:
-//         e_ij = LeakyReLU(src_scores[i] + dst_scores[j])
-//       → Build a CSR with these attention logits as values  (SpSDDMM)
-//    4. α = edge_softmax(e_csr)                   (sparse softmax per row)
-//    5. out = spmm(α, Wh) + b                     (attention-weighted aggregation)
+//    1. Wh = matmul(H, W)                          [N × F_out]
+//    2. src_scores[i] = a_l^T · Wh[i]              (OpenMP + AVX2)
+//       dst_scores[j] = a_r^T · Wh[j]
+//    3–5. FUSED: For each node i in parallel:
+//           e_ij = LeakyReLU(src[i] + dst[j])      (SpSDDMM)
+//           α_ij = softmax(e_row)                   (edge_softmax)
+//           out[i] = Σ_j α_ij · Wh[j]              (SpMM, AVX2 FMA)
 //    6. activation(out)
+//
+//  This eliminates 3 × nnz floats + 2 CSR structure copies vs.
+//  the original Phase 6 implementation.
 //
 // ============================================================================
 Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
@@ -799,7 +934,7 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
             std::to_string(H.rows()) + " rows. They must match (N nodes).");
     }
 
-    const std::size_t N = H.rows();
+    const std::size_t N     = H.rows();
     const std::size_t F_out = out_features_;
     const auto& rp = A.row_ptr();
     const auto& ci = A.col_ind();
@@ -807,55 +942,129 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
     // ── Step 1: Linear transform  Wh = H · W ────────────────────────────────
     Tensor Wh = matmul(H, weight_);   // (N × F_out)
 
-    // ── Step 2: Compute per-node attention scores (SpSDDMM preparation) ──────
+    // ── Step 2: Precompute per-node attention dot products ───────────────────
     //   src_scores[i] = a_l^T · Wh[i]   (source contribution)
     //   dst_scores[j] = a_r^T · Wh[j]   (target contribution)
-    const float* wh_data  = Wh.data().data();
-    const float* al_data  = attn_left_.data().data();
-    const float* ar_data  = attn_right_.data().data();
+    const float* wh_data = Wh.data().data();
+    const float* al_data = attn_left_.data().data();
+    const float* ar_data = attn_right_.data().data();
 
     std::vector<float> src_scores(N, 0.0f);
     std::vector<float> dst_scores(N, 0.0f);
 
+    #pragma omp parallel for schedule(static)
     for (std::size_t i = 0; i < N; ++i) {
         float s = 0.0f, d = 0.0f;
         const float* whi = wh_data + i * F_out;
+#ifdef __AVX2__
+        __m256 vs = _mm256_setzero_ps();
+        __m256 vd = _mm256_setzero_ps();
+        std::size_t f = 0;
+        for (; f + 8 <= F_out; f += 8) {
+            __m256 vw  = _mm256_loadu_ps(whi + f);
+            __m256 val = _mm256_loadu_ps(al_data + f);
+            __m256 var = _mm256_loadu_ps(ar_data + f);
+            vs = _mm256_fmadd_ps(val, vw, vs);
+            vd = _mm256_fmadd_ps(var, vw, vd);
+        }
+        // Horizontal reduction
+        float tmp_s[8], tmp_d[8];
+        _mm256_storeu_ps(tmp_s, vs);
+        _mm256_storeu_ps(tmp_d, vd);
+        for (int k = 0; k < 8; ++k) { s += tmp_s[k]; d += tmp_d[k]; }
+        for (; f < F_out; ++f) {
+            s += al_data[f] * whi[f];
+            d += ar_data[f] * whi[f];
+        }
+#else
         for (std::size_t f = 0; f < F_out; ++f) {
             s += al_data[f] * whi[f];
             d += ar_data[f] * whi[f];
         }
+#endif
         src_scores[i] = s;
         dst_scores[i] = d;
     }
 
-    // ── Step 3: SpSDDMM — compute edge attention logits ─────────────────────
-    //   For each edge (i, j):  e_ij = LeakyReLU(src_scores[i] + dst_scores[j])
-    const std::size_t nnz = ci.size();
-    std::vector<float> edge_logits(nnz);
+    // ── Fused Steps 3-5: SpSDDMM + edge_softmax + SpMM ─────────────────────
+    //
+    //  Phase 9 Operator Fusion:  Instead of materialising the nnz-sized
+    //  attention logit CSR (SpSDDMM), then a second nnz-sized softmax CSR
+    //  (edge_softmax), then calling spmm, we fuse all three into a single
+    //  row-wise loop:
+    //
+    //    For each source node i:
+    //      1. Compute e_ij = LeakyReLU(src[i] + dst[j]) for j ∈ N(i)
+    //      2. Row softmax → α_ij
+    //      3. Accumulate  out[i] += α_ij · Wh[j]
+    //
+    //  This eliminates 3 × nnz floats + 2 full CSR structure copies,
+    //  dramatically reducing peak memory for large graphs.
+    //
+    Tensor out = Tensor::dense(N, F_out);
+    float* out_data = out.data().data();
 
+    #pragma omp parallel for schedule(dynamic)
     for (std::size_t i = 0; i < N; ++i) {
+        const int32_t row_start = rp[i];
+        const int32_t row_end   = rp[i + 1];
+
+        if (row_start == row_end) continue;   // isolated node
+
         const float si = src_scores[i];
-        for (int32_t nz = rp[i]; nz < rp[i + 1]; ++nz) {
-            const auto j = static_cast<std::size_t>(ci[nz]);
+        const int32_t row_len = row_end - row_start;
+
+        // ── Phase A: Compute attention logits + row softmax ─────────────
+        //    Small per-row buffer (max-degree sized, stack-friendly)
+        std::vector<float> attn(static_cast<std::size_t>(row_len));
+
+        // LeakyReLU attention logits + find row max (fused)
+        float row_max = -std::numeric_limits<float>::infinity();
+        for (int32_t idx = 0; idx < row_len; ++idx) {
+            const auto j = static_cast<std::size_t>(ci[row_start + idx]);
             float e = si + dst_scores[j];
-            // LeakyReLU
-            edge_logits[nz] = (e >= 0.0f) ? e : negative_slope_ * e;
+            e = (e >= 0.0f) ? e : negative_slope_ * e;
+            attn[static_cast<std::size_t>(idx)] = e;
+            row_max = std::max(row_max, e);
+        }
+
+        // Exp + sum
+        float row_sum = 0.0f;
+        for (int32_t idx = 0; idx < row_len; ++idx) {
+            float e = std::exp(attn[static_cast<std::size_t>(idx)] - row_max);
+            attn[static_cast<std::size_t>(idx)] = e;
+            row_sum += e;
+        }
+
+        // Normalize
+        const float inv_sum = (row_sum > 0.0f) ? (1.0f / row_sum) : 0.0f;
+        for (int32_t idx = 0; idx < row_len; ++idx) {
+            attn[static_cast<std::size_t>(idx)] *= inv_sum;
+        }
+
+        // ── Phase B: Attention-weighted aggregation (fused SpMM) ────────
+        float* out_i = out_data + i * F_out;
+        for (int32_t idx = 0; idx < row_len; ++idx) {
+            const auto j = static_cast<std::size_t>(ci[row_start + idx]);
+            const float alpha = attn[static_cast<std::size_t>(idx)];
+            const float* wh_j = wh_data + j * F_out;
+#ifdef __AVX2__
+            const __m256 va = _mm256_set1_ps(alpha);
+            std::size_t f = 0;
+            for (; f + 8 <= F_out; f += 8) {
+                __m256 vo = _mm256_loadu_ps(out_i + f);
+                __m256 vw = _mm256_loadu_ps(wh_j + f);
+                vo = _mm256_fmadd_ps(va, vw, vo);
+                _mm256_storeu_ps(out_i + f, vo);
+            }
+            for (; f < F_out; ++f) out_i[f] += alpha * wh_j[f];
+#else
+            for (std::size_t f = 0; f < F_out; ++f) {
+                out_i[f] += alpha * wh_j[f];
+            }
+#endif
         }
     }
-
-    // Build CSR with attention logits as values
-    std::vector<int32_t> rp_copy(rp.begin(), rp.end());
-    std::vector<int32_t> ci_copy(ci.begin(), ci.end());
-    Tensor attn_csr = Tensor::sparse_csr(N, N,
-                                         std::move(rp_copy),
-                                         std::move(ci_copy),
-                                         std::move(edge_logits));
-
-    // ── Step 4: Sparse Softmax — normalize attention per neighborhood ────────
-    Tensor alpha = edge_softmax(attn_csr);
-
-    // ── Step 5: Attention-weighted message passing  out = spmm(α, Wh) ────────
-    Tensor out = spmm(alpha, Wh);
 
     // Bias addition
     if (use_bias_) {

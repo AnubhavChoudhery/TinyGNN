@@ -1,0 +1,39 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: "TinyGNN: A Zero-Dependency C++ Inference Engine for Sparse Graph Neural Networks"
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Jai Ansh Singh
+    family-names: Bindra
+    affiliation: JBAC EdTech
+  - given-names: Anubhav
+    family-names: Choudhery
+    affiliation: JBAC EdTech
+repository-code: "https://github.com/JaiAnshSB/TinyGNN"
+url: "https://github.com/JaiAnshSB/TinyGNN"
+abstract: >-
+  TinyGNN is a dependency-free C++17 inference engine optimized for
+  Sparse Graph Neural Networks (GCN, GraphSAGE, GAT). It features
+  hybrid Dense/SparseCSR tensor storage, AVX2 SIMD intrinsics,
+  OpenMP thread parallelism, operator fusion for GAT and GraphSAGE
+  kernels, and Python bindings via pybind11 with zero-copy NumPy,
+  SciPy, and PyTorch interoperability.
+keywords:
+  - graph neural networks
+  - sparse inference
+  - GCN
+  - GraphSAGE
+  - GAT
+  - C++17
+  - pybind11
+  - SIMD
+  - operator fusion
+  - zero-dependency
+license: MIT
+version: 0.1.0
+date-released: "2026-02-28"

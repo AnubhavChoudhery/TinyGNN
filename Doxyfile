@@ -1,0 +1,89 @@
+# =============================================================================
+#  TinyGNN — Doxygen Configuration
+#  Doxyfile
+#
+#  Generates C++ API documentation from the annotated header files.
+#
+#  Usage:
+#    doxygen Doxyfile
+#
+#  Output: docs/doxygen/html/index.html
+# =============================================================================
+
+# ── Project metadata ─────────────────────────────────────────────────────────
+PROJECT_NAME           = "TinyGNN"
+PROJECT_NUMBER         = "0.1.0"
+PROJECT_BRIEF          = "A zero-dependency C++17 inference engine for Sparse Graph Neural Networks"
+PROJECT_LOGO           =
+
+# ── Input ────────────────────────────────────────────────────────────────────
+INPUT                  = include/tinygnn \
+                         src
+INPUT_ENCODING         = UTF-8
+FILE_PATTERNS          = *.hpp *.cpp
+RECURSIVE              = YES
+
+# ── Output ───────────────────────────────────────────────────────────────────
+OUTPUT_DIRECTORY       = docs/doxygen
+GENERATE_HTML          = YES
+HTML_OUTPUT            = html
+HTML_THEME             = 
+GENERATE_LATEX         = NO
+GENERATE_XML           = YES
+XML_OUTPUT             = xml
+
+# ── Extraction ───────────────────────────────────────────────────────────────
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = YES
+EXTRACT_LOCAL_CLASSES  = YES
+EXTRACT_ANON_NSPACES   = NO
+
+# ── Source browsing ──────────────────────────────────────────────────────────
+SOURCE_BROWSER         = YES
+INLINE_SOURCES         = NO
+STRIP_CODE_COMMENTS    = NO
+REFERENCED_BY_RELATION = YES
+REFERENCES_RELATION    = YES
+
+# ── Namespaces ───────────────────────────────────────────────────────────────
+HIDE_UNDOC_MEMBERS     = NO
+HIDE_UNDOC_CLASSES     = NO
+SHOW_NAMESPACES        = YES
+
+# ── Graphs ───────────────────────────────────────────────────────────────────
+HAVE_DOT               = YES
+DOT_IMAGE_FORMAT       = svg
+INTERACTIVE_SVG        = YES
+CLASS_DIAGRAMS         = YES
+COLLABORATION_GRAPH    = YES
+INCLUDE_GRAPH          = YES
+INCLUDED_BY_GRAPH      = YES
+CALL_GRAPH             = NO
+CALLER_GRAPH           = NO
+GRAPHICAL_HIERARCHY    = YES
+DIRECTORY_GRAPH        = YES
+DOT_GRAPH_MAX_NODES    = 100
+MAX_DOT_GRAPH_DEPTH    = 0
+
+# ── Preprocessing ────────────────────────────────────────────────────────────
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = NO
+PREDEFINED             = __AVX2__ \
+                         _OPENMP
+
+# ── Warnings ─────────────────────────────────────────────────────────────────
+WARNINGS               = YES
+WARN_IF_UNDOCUMENTED   = YES
+WARN_IF_DOC_ERROR      = YES
+WARN_NO_PARAMDOC       = YES
+
+# ── Styling ──────────────────────────────────────────────────────────────────
+GENERATE_TREEVIEW      = YES
+DISABLE_INDEX          = NO
+FULL_SIDEBAR           = NO
+HTML_COLORSTYLE        = LIGHT
+HTML_DYNAMIC_MENUS     = YES
+HTML_DYNAMIC_SECTIONS  = YES
+SEARCHENGINE           = YES

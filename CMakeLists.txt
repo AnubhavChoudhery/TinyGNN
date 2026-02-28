@@ -30,6 +30,20 @@ target_include_directories(tinygnn_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
+# ── OpenMP (Phase 8) ───────────────────────────────────────────────────────
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(tinygnn_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# ── AVX2 + FMA intrinsics (Phase 8) ────────────────────────────────────────
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+check_cxx_compiler_flag("-mfma"  COMPILER_SUPPORTS_FMA)
+if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+    target_compile_options(tinygnn_core PRIVATE -mavx2 -mfma)
+endif()
+
 # ── Tests ───────────────────────────────────────────────────────────────────
 enable_testing()
 
@@ -68,3 +82,7 @@ add_test(NAME GATTests COMMAND test_gat)
 add_executable(test_e2e tests/test_e2e.cpp)
 target_link_libraries(test_e2e PRIVATE tinygnn_core)
 add_test(NAME E2ETests COMMAND test_e2e)
+
+# ── Benchmark (Phase 8) ────────────────────────────────────────────────────
+add_executable(bench_parallel benchmarks/bench_parallel.cpp)
+target_link_libraries(bench_parallel PRIVATE tinygnn_core)

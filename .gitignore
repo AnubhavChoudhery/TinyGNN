@@ -48,6 +48,13 @@ callgrind.out*
 #Python stuff.
 __pycache__/
 *.pyc
+*.pyd
+*.egg-info/
+dist/
+build-cpp/
+.venv/
+.pytest_cache/
+*.egg
 python/tinygnn/__pycache__/
 python/tinygnn/*.pyc
 

@@ -1,86 +1,91 @@
 #!/usr/bin/env python3
 """
-TinyGNN — GNN Layer Benchmarks + PyTorch Geometric Accuracy Validation
+TinyGNN — Comprehensive GNN Benchmark & Accuracy Validation
 scripts/bench_gnn.py
 
-Benchmarks:
-  • GCNLayer, SAGELayer (Mean, Max), GATLayer
-  • Metrics: wall time (ms) and peak RSS memory (MB)
-  • Graph sizes: small (1 K nodes), medium (10 K nodes), large (100 K nodes)
-  • Threads: controlled via OMP_NUM_THREADS env var
+Covers:
+  • TinyGNN (single-thread / unoptimized)  vs
+    TinyGNN (multi-thread / optimized)     vs
+    PyTorch Geometric (reference)
+  • Metrics: wall time (ms, median), peak memory (MB via tracemalloc)
+  • Layers: GCNLayer, SAGELayer-Mean, SAGELayer-Max, GATLayer
+  • Graph sizes: small (1K nodes), medium (10K nodes), large (100K nodes)
+  • Accuracy: output logit agreement between TinyGNN and PyG (max|diff|)
 
-Accuracy:
-  • When PyTorch Geometric is installed, validates TinyGNN output logits
-    against torch_geometric reference on a small graph (tolerance 1e-4).
+Output:
+  benchmarks/gnn_bench_results_timing.csv   — timing + memory rows
+  benchmarks/gnn_bench_results_accuracy.csv — accuracy rows
 
 Usage:
-    # Benchmark only (no PyG required):
-    python scripts/bench_gnn.py
-
-    # Include accuracy validation (requires torch + torch_geometric):
-    python scripts/bench_gnn.py --accuracy
-
-    # Only run accuracy check:
-    python scripts/bench_gnn.py --accuracy --no-bench
-
-    # Larger repetitions for stable timing:
-    python scripts/bench_gnn.py --reps 20
+    python scripts/bench_gnn.py              # all benchmarks + accuracy
+    python scripts/bench_gnn.py --reps 20    # more reps for stable timing
+    python scripts/bench_gnn.py --no-bench   # accuracy only
 """
 
-import sys
-import os
+from __future__ import annotations
+
 import argparse
+import ctypes
+import csv
+import gc
+import os
+import sys
 import time
 import tracemalloc
-import gc
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 # ── Path setup ───────────────────────────────────────────────────────────────
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, PROJECT_DIR)
 sys.path.insert(0, os.path.join(PROJECT_DIR, "python"))
 
 import _tinygnn_core as tg
 
+# ── OpenMP thread control ─────────────────────────────────────────────────────
+def _make_omp_setter():
+    """Return callable (n: int)->None that changes OMP thread count at runtime."""
+    for lib_name in ["libgomp-1.dll", "libgomp.so.1", "libgomp.so",
+                     "libiomp5.dll", "libiomp5.so", "libomp.dylib", "libomp.so"]:
+        try:
+            lib = ctypes.CDLL(lib_name)
+            fn  = lib.omp_set_num_threads
+            fn.argtypes = [ctypes.c_int]
+            fn.restype  = None
+            return fn
+        except Exception:
+            pass
+    # env-var fallback (works before first parallel region)
+    def _fallback(n: int):
+        os.environ["OMP_NUM_THREADS"] = str(n)
+    return _fallback
+
+_omp_set_threads = _make_omp_setter()
+N_CORES = os.cpu_count() or 4
+
 
 # ============================================================================
-#  Graph generation helpers
+#  Graph helpers
 # ============================================================================
 
 def make_random_graph_csr(num_nodes: int, avg_degree: int, seed: int = 42):
-    """Generate a random undirected graph as a scipy CSR matrix.
-
-    Uses a simple random edge model: for each node i, sample `avg_degree`
-    random neighbours uniformly, then symmetrise. Self-loops are excluded.
-
-    Returns a scipy.sparse.csr_matrix of shape (num_nodes, num_nodes).
-    """
+    """Random undirected symmetric graph as scipy CSR (float32 ones)."""
     from scipy.sparse import csr_matrix  # type: ignore
-
     rng = np.random.default_rng(seed)
-    rows_list = []
-    cols_list = []
-
+    rows_l, cols_l = [], []
     for src in range(num_nodes):
-        targets = rng.choice(num_nodes, size=avg_degree, replace=False)
+        k = min(avg_degree, num_nodes - 1)
+        candidates = np.delete(np.arange(num_nodes), src)
+        targets = rng.choice(candidates, size=k, replace=False)
         for dst in targets:
-            if dst != src:
-                rows_list.append(src)
-                cols_list.append(dst)
-                rows_list.append(dst)   # symmetrise
-                cols_list.append(src)
-
-    rows_arr = np.array(rows_list, dtype=np.int32)
-    cols_arr = np.array(cols_list, dtype=np.int32)
-    vals_arr = np.ones(len(rows_arr), dtype=np.float32)
-
-    mat = csr_matrix(
-        (vals_arr, (rows_arr, cols_arr)),
-        shape=(num_nodes, num_nodes),
-    )
-    # Eliminate duplicates by summing and then clipping to 1
+            rows_l.append(src); cols_l.append(dst)
+            rows_l.append(dst); cols_l.append(src)
+    r = np.array(rows_l, dtype=np.int32)
+    c = np.array(cols_l, dtype=np.int32)
+    v = np.ones(len(r), dtype=np.float32)
+    mat = csr_matrix((v, (r, c)), shape=(num_nodes, num_nodes))
     mat.data[:] = 1.0
     mat.sum_duplicates()
     mat.sort_indices()
@@ -93,343 +98,344 @@ def scipy_to_tinygnn(mat):
 
 
 # ============================================================================
-#  TinyGNN layer factories
+#  Weight factories  (same weights shared between TinyGNN and PyG)
 # ============================================================================
 
-def make_gcn_layer(F_in: int, F_out: int, seed: int = 0):
-    """Create a GCNLayer with random weight + zero bias."""
+def _rand(shape, scale, rng):
+    return (rng.standard_normal(shape) * scale).astype(np.float32)
+
+def _gcn_weights(F_in, F_out, seed=0):
     rng = np.random.default_rng(seed)
-    W = (rng.standard_normal((F_in, F_out)) * (2.0 / F_in) ** 0.5).astype(np.float32)
-    b = np.zeros((1, F_out), dtype=np.float32)
-    layer = tg.GCNLayer(F_in, F_out, True, tg.Activation.RELU)
-    layer.set_weight(tg.Tensor.from_numpy(W))
-    layer.set_bias(tg.Tensor.from_numpy(b))
-    return layer
+    return {"W": _rand((F_in, F_out), (2/F_in)**0.5, rng),
+            "b": np.zeros((1, F_out), dtype=np.float32)}
 
-
-def make_sage_layer(F_in: int, F_out: int, agg, seed: int = 0):
-    """Create a SAGELayer (Mean or Max) with random weights + zero bias."""
+def _sage_weights(F_in, F_out, seed=0):
     rng = np.random.default_rng(seed)
-    scale = (2.0 / F_in) ** 0.5
-    Wn = (rng.standard_normal((F_in, F_out)) * scale).astype(np.float32)
-    Ws = (rng.standard_normal((F_in, F_out)) * scale).astype(np.float32)
-    b  = np.zeros((1, F_out), dtype=np.float32)
-    layer = tg.SAGELayer(F_in, F_out, agg, True, tg.Activation.RELU)
-    layer.set_weight_neigh(tg.Tensor.from_numpy(Wn))
-    layer.set_weight_self(tg.Tensor.from_numpy(Ws))
-    layer.set_bias(tg.Tensor.from_numpy(b))
-    return layer
+    s = (2/F_in)**0.5
+    return {"Wn": _rand((F_in, F_out), s, rng),
+            "Ws": _rand((F_in, F_out), s, rng),
+            "b":  np.zeros((1, F_out), dtype=np.float32)}
 
-
-def make_gat_layer(F_in: int, F_out: int, seed: int = 0):
-    """Create a GATLayer with random weight + attention vectors + zero bias."""
+def _gat_weights(F_in, F_out, seed=0):
     rng = np.random.default_rng(seed)
-    scale = (2.0 / F_in) ** 0.5
-    W  = (rng.standard_normal((F_in, F_out)) * scale).astype(np.float32)
-    al = (rng.standard_normal((1, F_out)) * 0.1).astype(np.float32)
-    ar = (rng.standard_normal((1, F_out)) * 0.1).astype(np.float32)
-    b  = np.zeros((1, F_out), dtype=np.float32)
-    layer = tg.GATLayer(F_in, F_out, 0.2, True, tg.Activation.RELU)
-    layer.set_weight(tg.Tensor.from_numpy(W))
-    layer.set_attn_left(tg.Tensor.from_numpy(al))
-    layer.set_attn_right(tg.Tensor.from_numpy(ar))
-    layer.set_bias(tg.Tensor.from_numpy(b))
-    return layer
+    return {"W":  _rand((F_in, F_out), (2/F_in)**0.5, rng),
+            "al": _rand((1, F_out), 0.1, rng),
+            "ar": _rand((1, F_out), 0.1, rng),
+            "b":  np.zeros((1, F_out), dtype=np.float32)}
+
+
+# ── TinyGNN layer builders ────────────────────────────────────────────────────
+
+def make_tg_gcn(w, F_in, F_out):
+    ly = tg.GCNLayer(F_in, F_out, True, tg.Activation.NONE)
+    ly.set_weight(tg.Tensor.from_numpy(w["W"]))
+    ly.set_bias(tg.Tensor.from_numpy(w["b"]))
+    return ly
+
+def make_tg_sage(w, F_in, F_out, agg):
+    ly = tg.SAGELayer(F_in, F_out, agg, True, tg.Activation.NONE)
+    ly.set_weight_neigh(tg.Tensor.from_numpy(w["Wn"]))
+    ly.set_weight_self(tg.Tensor.from_numpy(w["Ws"]))
+    ly.set_bias(tg.Tensor.from_numpy(w["b"]))
+    return ly
+
+def make_tg_gat(w, F_in, F_out):
+    ly = tg.GATLayer(F_in, F_out, 0.2, True, tg.Activation.NONE)
+    ly.set_weight(tg.Tensor.from_numpy(w["W"]))
+    ly.set_attn_left(tg.Tensor.from_numpy(w["al"]))
+    ly.set_attn_right(tg.Tensor.from_numpy(w["ar"]))
+    ly.set_bias(tg.Tensor.from_numpy(w["b"]))
+    return ly
 
 
 # ============================================================================
-#  Timing + memory measurement
+#  Timing / memory helper
 # ============================================================================
 
-def measure(fn, warmup: int = 2, reps: int = 10):
-    """Run fn() warmup + reps times; return (median_ms, peak_mb).
-
-    Peak memory is measured via tracemalloc over a single cold run performed
-    after the timed loop (so the GC state is representative).
-    """
-    # Warm-up
+def _timeit(fn, warmup: int, reps: int) -> Tuple[float, float]:
+    """Return (median_ms, peak_mb).  OMP thread count must already be set."""
     for _ in range(warmup):
         fn()
-
-    # Timed runs
-    times_ms = []
+    times = []
     for _ in range(reps):
         gc.collect()
         t0 = time.perf_counter()
         fn()
-        t1 = time.perf_counter()
-        times_ms.append((t1 - t0) * 1000.0)
-
-    median_ms = float(np.median(times_ms))
-
-    # Memory measurement (one cold run with tracemalloc)
+        times.append((time.perf_counter() - t0) * 1_000.0)
     gc.collect()
     tracemalloc.start()
     fn()
     _, peak = tracemalloc.get_traced_memory()
     tracemalloc.stop()
-    peak_mb = peak / (1024 ** 2)
-
-    return median_ms, peak_mb
+    return float(np.median(times)), peak / (1024 ** 2)
 
 
 # ============================================================================
-#  Benchmark runner
+#  PyG helpers
 # ============================================================================
 
-GRAPH_CONFIGS = [
-    # (label,  num_nodes, avg_degree, F_in, F_out)
-    ("small  (1 K,   5 avg-deg, 64→32)",   1_000,    5, 64,  32),
-    ("medium (10 K, 10 avg-deg, 128→64)", 10_000,   10, 128, 64),
-    ("large  (100K,  5 avg-deg, 256→128)", 100_000,   5, 256, 128),
-]
-
-
-def run_benchmarks(reps: int = 10):
-    print("\n" + "=" * 80)
-    print("  TinyGNN — GNN Layer Benchmarks")
-    print("  wall time = median over {} timed runs  |  memory = peak tracemalloc".format(reps))
-    print("=" * 80)
-    header = f"{'Config':<45}  {'Layer':<18}  {'Time (ms)':>10}  {'Mem (MB)':>10}"
-    print(header)
-    print("-" * len(header))
-
-    for label, N, D, F_in, F_out in GRAPH_CONFIGS:
-        print(f"\n  Graph: {label}")
-
-        # Build graph structures once per config
-        scipy_mat = make_random_graph_csr(N, D, seed=7)
-        A_sparse  = scipy_to_tinygnn(scipy_mat)
-        A_norm    = tg.gcn_norm(tg.add_self_loops(A_sparse))
-        A_sl      = tg.add_self_loops(A_sparse)   # for GAT
-        H         = tg.Tensor.from_numpy(
-            np.random.default_rng(3).standard_normal((N, F_in)).astype(np.float32)
-        )
-
-        # GCN
-        gcn = make_gcn_layer(F_in, F_out)
-        ms, mb = measure(lambda: gcn.forward(A_norm, H), reps=reps)
-        print(f"  {'':45}  {'GCNLayer':18}  {ms:>10.2f}  {mb:>10.3f}")
-
-        # SAGE Mean
-        sage_mean = make_sage_layer(F_in, F_out, tg.SAGELayer.Aggregator.Mean)
-        ms, mb = measure(lambda: sage_mean.forward(A_sparse, H), reps=reps)
-        print(f"  {'':45}  {'SAGELayer (Mean)':18}  {ms:>10.2f}  {mb:>10.3f}")
-
-        # SAGE Max
-        sage_max = make_sage_layer(F_in, F_out, tg.SAGELayer.Aggregator.Max)
-        ms, mb = measure(lambda: sage_max.forward(A_sparse, H), reps=reps)
-        print(f"  {'':45}  {'SAGELayer (Max)':18}  {ms:>10.2f}  {mb:>10.3f}")
-
-        # GAT
-        gat  = make_gat_layer(F_in, F_out)
-        ms, mb = measure(lambda: gat.forward(A_sl, H), reps=reps)
-        print(f"  {'':45}  {'GATLayer':18}  {ms:>10.2f}  {mb:>10.3f}")
-
-    print("\n" + "=" * 80)
-
-
-# ============================================================================
-#  PyTorch Geometric accuracy validation
-# ============================================================================
-
-def _try_import_pyg():
+def _try_pyg():
     try:
         import torch
-        import torch_geometric  # noqa: F401
         from torch_geometric.nn import GCNConv, SAGEConv, GATConv
         return torch, GCNConv, SAGEConv, GATConv
     except ImportError:
         return None
 
-
-def _build_pyg_edge_index(scipy_mat):
-    """Build a torch edge_index (2 × nnz) from a scipy CSR matrix."""
+def _pyg_edge_index(scipy_mat):
     import torch
     coo = scipy_mat.tocoo()
-    row = torch.from_numpy(coo.row.astype(np.int64))
-    col = torch.from_numpy(coo.col.astype(np.int64))
-    return torch.stack([row, col], dim=0)  # (2, nnz)
+    r = torch.from_numpy(coo.row.astype(np.int64))
+    c = torch.from_numpy(coo.col.astype(np.int64))
+    return torch.stack([r, c], dim=0)
 
-
-def _run_gcn_accuracy():
-    """Validate GCNLayer output against PyG GCNConv."""
-    result = _try_import_pyg()
-    if result is None:
-        print("  [SKIP] PyTorch Geometric not installed — skipping GCN accuracy check.")
-        return None
-    torch, GCNConv, _, _ = result
-
-    N, F_in, F_out = 20, 4, 3
-    seed = 42
-
-    rng = np.random.default_rng(seed)
-    # Random symmetric adjacency (with self-loops for GCN)
-    scipy_mat = make_random_graph_csr(N, avg_degree=4, seed=seed)
-
-    W_np   = (rng.standard_normal((F_in, F_out)) * 0.1).astype(np.float32)
-    b_np   = (rng.standard_normal((1, F_out)) * 0.05).astype(np.float32)
-    H_np   = (rng.standard_normal((N, F_in)) * 1.0).astype(np.float32)
-
-    # ── TinyGNN ──────────────────────────────────────────────────────────────
-    A_tg   = scipy_to_tinygnn(scipy_mat)
-    A_norm = tg.gcn_norm(tg.add_self_loops(A_tg))
-    H_tg   = tg.Tensor.from_numpy(H_np)
-    layer  = tg.GCNLayer(F_in, F_out, True, tg.Activation.NONE)
-    layer.set_weight(tg.Tensor.from_numpy(W_np))
-    layer.set_bias(tg.Tensor.from_numpy(b_np))
-    out_tg = layer.forward(A_norm, H_tg).to_numpy()   # (N, F_out)
-
-    # ── PyTorch Geometric GCNConv ─────────────────────────────────────────────
-    # GCNConv stores weight as (F_out, F_in) and applies: out = norm(A) H W^T + b
-    import torch
-    edge_index = _build_pyg_edge_index(scipy_mat)
-    gcn_pyg = GCNConv(F_in, F_out, bias=True, normalize=True, add_self_loops=True)
+def _pyg_gcn_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
+    torch, GCNConv, _, _ = pyg_cls
+    conv = GCNConv(F_in, F_out, bias=True, normalize=True, add_self_loops=True)
     with torch.no_grad():
-        gcn_pyg.lin.weight.copy_(torch.from_numpy(W_np.T))    # (F_out, F_in)
-        gcn_pyg.bias.copy_(torch.from_numpy(b_np.flatten()))
-    H_torch = torch.from_numpy(H_np)
+        conv.lin.weight.copy_(torch.from_numpy(w["W"].T))
+        conv.bias.copy_(torch.from_numpy(w["b"].flatten()))  # includes self-loops
+    def _f():
+        with torch.no_grad(): conv(H_torch, edge_index)
+    return _f
+
+def _pyg_sage_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
+    torch, _, SAGEConv, _ = pyg_cls
+    conv = SAGEConv(F_in, F_out, bias=True, aggr="mean", normalize=False, root_weight=True)
     with torch.no_grad():
-        out_pyg = gcn_pyg(H_torch, edge_index).numpy()         # (N, F_out)
+        # PyG SAGEConv: lin_l(agg_neigh) + lin_r(self)
+        # TinyGNN:      mean_agg @ Wn   + H @ Ws + b
+        conv.lin_l.weight.copy_(torch.from_numpy(w["Wn"].T))  # lin_l → neighbor agg
+        conv.lin_r.weight.copy_(torch.from_numpy(w["Ws"].T))  # lin_r → self
+        conv.lin_l.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    def _f():
+        with torch.no_grad(): conv(H_torch, edge_index)
+    return _f
 
-    max_diff = float(np.abs(out_tg - out_pyg).max())
-    rel_diff = float(np.abs(out_tg - out_pyg).mean() / (np.abs(out_pyg).mean() + 1e-8))
-    match = max_diff < 1e-3
-    print(f"  GCNLayer   vs GCNConv:  max|diff|={max_diff:.2e}  mean_rel={rel_diff:.2e}  "
-          f"{'PASS ✓' if match else 'FAIL ✗'}")
-    return match
-
-
-def _run_sage_accuracy():
-    """Validate SAGELayer (Mean) output against PyG SAGEConv."""
-    result = _try_import_pyg()
-    if result is None:
-        print("  [SKIP] PyTorch Geometric not installed — skipping SAGE accuracy check.")
-        return None
-    torch, _, SAGEConv, _ = result
-
-    N, F_in, F_out = 20, 4, 3
-    seed = 43
-
-    rng = np.random.default_rng(seed)
-    scipy_mat = make_random_graph_csr(N, avg_degree=4, seed=seed)
-
-    Wn_np  = (rng.standard_normal((F_in, F_out)) * 0.1).astype(np.float32)
-    Ws_np  = (rng.standard_normal((F_in, F_out)) * 0.1).astype(np.float32)
-    b_np   = (rng.standard_normal((1, F_out)) * 0.05).astype(np.float32)
-    H_np   = (rng.standard_normal((N, F_in)) * 1.0).astype(np.float32)
-
-    # ── TinyGNN ──────────────────────────────────────────────────────────────
-    A_tg   = scipy_to_tinygnn(scipy_mat)
-    H_tg   = tg.Tensor.from_numpy(H_np)
-    layer  = tg.SAGELayer(F_in, F_out, tg.SAGELayer.Aggregator.Mean, True, tg.Activation.NONE)
-    layer.set_weight_neigh(tg.Tensor.from_numpy(Wn_np))
-    layer.set_weight_self(tg.Tensor.from_numpy(Ws_np))
-    layer.set_bias(tg.Tensor.from_numpy(b_np))
-    out_tg = layer.forward(A_tg, H_tg).to_numpy()   # (N, F_out)
-
-    # ── PyTorch Geometric SAGEConv ────────────────────────────────────────────
-    # SAGEConv(F_in, F_out): stores lin_l (self) and lin_r (neigh) as (F_out, F_in)
-    # out_i = lin_l(h_i) + lin_r(mean_{j∈N(i)} h_j) + b
-    import torch
-    edge_index = _build_pyg_edge_index(scipy_mat)
-    sage_pyg = SAGEConv(F_in, F_out, bias=True, aggr='mean', normalize=False, root_weight=True)
+def _pyg_gat_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
+    torch, _, _, GATConv = pyg_cls
+    conv = GATConv(F_in, F_out, heads=1, bias=True, negative_slope=0.2,
+                   add_self_loops=True, concat=True)
     with torch.no_grad():
-        # lin_r = neighbour transform (Wn), lin_l = self transform (Ws)
-        sage_pyg.lin_r.weight.copy_(torch.from_numpy(Wn_np.T))   # neigh weight
-        sage_pyg.lin_l.weight.copy_(torch.from_numpy(Ws_np.T))   # self weight
-        sage_pyg.lin_l.bias.copy_(torch.from_numpy(b_np.flatten()))
-    H_torch = torch.from_numpy(H_np)
-    with torch.no_grad():
-        out_pyg = sage_pyg(H_torch, edge_index).numpy()
-
-    max_diff = float(np.abs(out_tg - out_pyg).max())
-    rel_diff = float(np.abs(out_tg - out_pyg).mean() / (np.abs(out_pyg).mean() + 1e-8))
-    match = max_diff < 1e-3
-    print(f"  SAGELayer  vs SAGEConv: max|diff|={max_diff:.2e}  mean_rel={rel_diff:.2e}  "
-          f"{'PASS ✓' if match else 'FAIL ✗'}")
-    return match
+        conv.lin.weight.copy_(torch.from_numpy(w["W"].T))
+        # PyG: att_src applied to source (neighbor j) = ar in TinyGNN
+        #      att_dst applied to destination (center i) = al in TinyGNN
+        conv.att_src.copy_(torch.from_numpy(w["ar"]).reshape(1, 1, F_out))
+        conv.att_dst.copy_(torch.from_numpy(w["al"]).reshape(1, 1, F_out))
+        conv.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    def _f():
+        with torch.no_grad(): conv(H_torch, edge_index)
+    return _f
 
 
-def _run_gat_accuracy():
-    """Validate GATLayer output against PyG GATConv."""
-    result = _try_import_pyg()
-    if result is None:
-        print("  [SKIP] PyTorch Geometric not installed — skipping GAT accuracy check.")
-        return None
-    torch, _, _, GATConv = result
+# ============================================================================
+#  Accuracy validation
+# ============================================================================
 
-    N, F_in, F_out = 20, 4, 3
-    seed = 44
-
-    rng = np.random.default_rng(seed)
-    scipy_mat = make_random_graph_csr(N, avg_degree=4, seed=seed)
-
-    W_np   = (rng.standard_normal((F_in, F_out)) * 0.1).astype(np.float32)
-    al_np  = (rng.standard_normal((1, F_out)) * 0.1).astype(np.float32)
-    ar_np  = (rng.standard_normal((1, F_out)) * 0.1).astype(np.float32)
-    b_np   = (rng.standard_normal((1, F_out)) * 0.05).astype(np.float32)
-    H_np   = (rng.standard_normal((N, F_in)) * 1.0).astype(np.float32)
-
-    # ── TinyGNN ──────────────────────────────────────────────────────────────
-    A_tg   = scipy_to_tinygnn(scipy_mat)
+def run_accuracy(pyg_cls) -> List[Dict]:
+    if pyg_cls is None:
+        print("  [SKIP] torch_geometric not available — accuracy checks skipped.")
+        return []
+    torch, GCNConv, SAGEConv, GATConv = pyg_cls
+    N, F_in, F_out, seed = 30, 8, 4, 77
+    sm   = make_random_graph_csr(N, avg_degree=5, seed=seed)
+    A_tg = scipy_to_tinygnn(sm)
+    A_norm = tg.gcn_norm(A_tg)         # gcn_norm adds self-loops internally
     A_sl   = tg.add_self_loops(A_tg)
+    H_np   = np.random.default_rng(seed).standard_normal((N, F_in)).astype(np.float32)
     H_tg   = tg.Tensor.from_numpy(H_np)
-    layer  = tg.GATLayer(F_in, F_out, 0.2, True, tg.Activation.NONE)
-    layer.set_weight(tg.Tensor.from_numpy(W_np))
-    layer.set_attn_left(tg.Tensor.from_numpy(al_np))
-    layer.set_attn_right(tg.Tensor.from_numpy(ar_np))
-    layer.set_bias(tg.Tensor.from_numpy(b_np))
-    out_tg = layer.forward(A_sl, H_tg).to_numpy()   # (N, F_out)
+    H_t    = torch.from_numpy(H_np)
+    ei     = _pyg_edge_index(sm)
 
-    # ── PyTorch Geometric GATConv ─────────────────────────────────────────────
-    # GATConv(F_in, F_out, heads=1, bias=True, negative_slope=0.2, add_self_loops=True)
-    # Internally: lin = (F_in → F_out), att_src = (1, F_out), att_dst = (1, F_out)
-    import torch
-    edge_index = _build_pyg_edge_index(scipy_mat)
-    gat_pyg = GATConv(F_in, F_out, heads=1, bias=True, negative_slope=0.2,
-                      add_self_loops=True, concat=True)
-    with torch.no_grad():
-        gat_pyg.lin_src.weight.copy_(torch.from_numpy(W_np.T))   # (F_out, F_in)
-        gat_pyg.lin_dst.weight.copy_(torch.from_numpy(W_np.T))
-        gat_pyg.att_src.copy_(torch.from_numpy(al_np).reshape(1, 1, F_out))
-        gat_pyg.att_dst.copy_(torch.from_numpy(ar_np).reshape(1, 1, F_out))
-        gat_pyg.bias.copy_(torch.from_numpy(b_np.flatten()))
-    H_torch = torch.from_numpy(H_np)
-    with torch.no_grad():
-        out_pyg = gat_pyg(H_torch, edge_index).numpy()
-
-    max_diff = float(np.abs(out_tg - out_pyg).max())
-    rel_diff = float(np.abs(out_tg - out_pyg).mean() / (np.abs(out_pyg).mean() + 1e-8))
-    match = max_diff < 1e-3
-    print(f"  GATLayer   vs GATConv:  max|diff|={max_diff:.2e}  mean_rel={rel_diff:.2e}  "
-          f"{'PASS ✓' if match else 'FAIL ✗'}")
-    return match
-
-
-def run_accuracy_checks():
-    print("\n" + "=" * 80)
-    print("  TinyGNN vs PyTorch Geometric — Accuracy Validation")
-    print("  Tolerance: max|diff| < 1e-3 (float32 ops on synthetic 20-node graphs)")
-    print("=" * 80)
-
-    results = {}
-    results["GCN"]  = _run_gcn_accuracy()
-    results["SAGE"] = _run_sage_accuracy()
-    results["GAT"]  = _run_gat_accuracy()
-
+    results: List[Dict] = []
     print()
-    all_ok = all(v is not False for v in results.values())
-    if all(v is None for v in results.values()):
-        print("  All accuracy checks SKIPPED (install torch + torch_geometric to enable).")
-    elif all_ok:
-        print("  All accuracy checks PASSED.")
-    else:
-        failed = [k for k, v in results.items() if v is False]
-        print(f"  FAILED checks: {failed}")
-        sys.exit(1)
-    print("=" * 80)
-    return all_ok
+    print("  Accuracy (TinyGNN vs PyTorch Geometric)  —  N=30, F_in=8, F_out=4")
+    print("  " + "-" * 64)
+
+    def _chk(name, tg_out, pyg_out):
+        d = np.abs(tg_out - pyg_out)
+        md, me, re = d.max(), d.mean(), d.mean()/(np.abs(pyg_out).mean()+1e-8)
+        ok = bool(md < 2e-3)
+        print(f"  {'PASS' if ok else 'FAIL'}  {name:<18}  max|diff|={md:.2e}  "
+              f"mean|diff|={me:.2e}  rel={re:.2e}")
+        results.append({"layer": name, "max_diff": float(md),
+                        "mean_diff": float(me), "rel_diff": float(re), "pass": ok})
+
+    # GCN
+    w = _gcn_weights(F_in, F_out, seed)
+    ly = make_tg_gcn(w, F_in, F_out)
+    out_tg = ly.forward(A_norm, H_tg).to_numpy()
+    conv = GCNConv(F_in, F_out, bias=True, normalize=True, add_self_loops=True)
+    with torch.no_grad():
+        conv.lin.weight.copy_(torch.from_numpy(w["W"].T))
+        conv.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    with torch.no_grad(): out_pyg = conv(H_t, ei).numpy()
+    _chk("GCNLayer", out_tg, out_pyg)  # gcn_norm already adds self-loops
+
+    # SAGE-Mean
+    w = _sage_weights(F_in, F_out, seed)
+    ly = make_tg_sage(w, F_in, F_out, tg.SAGELayer.Aggregator.Mean)
+    out_tg = ly.forward(A_tg, H_tg).to_numpy()
+    conv = SAGEConv(F_in, F_out, bias=True, aggr="mean", normalize=False, root_weight=True)
+    with torch.no_grad():
+        # PyG SAGEConv: lin_l(agg_neigh) + lin_r(self)
+        conv.lin_l.weight.copy_(torch.from_numpy(w["Wn"].T))  # lin_l → neighbor agg
+        conv.lin_r.weight.copy_(torch.from_numpy(w["Ws"].T))  # lin_r → self
+        conv.lin_l.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    with torch.no_grad(): out_pyg = conv(H_t, ei).numpy()
+    _chk("SAGELayer-Mean", out_tg, out_pyg)
+
+    # GAT
+    w = _gat_weights(F_in, F_out, seed)
+    ly = make_tg_gat(w, F_in, F_out)
+    out_tg = ly.forward(A_sl, H_tg).to_numpy()
+    conv = GATConv(F_in, F_out, heads=1, bias=True, negative_slope=0.2,
+                   add_self_loops=True, concat=True)
+    with torch.no_grad():
+        conv.lin.weight.copy_(torch.from_numpy(w["W"].T))
+        # att_src = source/neighbor (ar), att_dst = destination/center (al)
+        conv.att_src.copy_(torch.from_numpy(w["ar"]).reshape(1,1,F_out))
+        conv.att_dst.copy_(torch.from_numpy(w["al"]).reshape(1,1,F_out))
+        conv.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    with torch.no_grad(): out_pyg = conv(H_t, ei).numpy()
+    _chk("GATLayer", out_tg, out_pyg)
+
+    ok_all = all(r["pass"] for r in results)
+    print(f"\n  Overall: {'ALL PASS' if ok_all else 'SOME FAIL'}")
+    return results
+
+
+# ============================================================================
+#  Main benchmark loop
+# ============================================================================
+
+GRAPH_CONFIGS = [
+    # (label,      N,       avg_deg, F_in,  F_out)
+    ("small-1K",   1_000,   5,       64,    32),
+    ("medium-10K", 10_000, 10,      128,    64),
+    ("large-100K", 100_000, 5,      256,   128),
+]
+
+
+def run_benchmarks(reps: int, pyg_cls) -> List[Dict]:
+    rows: List[Dict] = []
+    print()
+    print("=" * 84)
+    print(f"  TinyGNN  GNN Benchmarks   reps={reps}  cores={N_CORES}")
+    print(f"  Backends: TinyGNN-1T (unoptimized) | TinyGNN-{N_CORES}T (optimized) | PyG")
+    print("=" * 84)
+    hdr = (f"{'Graph':<13} {'Layer':<13} {'Backend':<22}"
+           f" {'ms':>8} {'MB':>7} {'vs 1T':>7} {'vs PyG':>8}")
+    print(hdr)
+    print("-" * len(hdr))
+
+    for label, N, avg_deg, F_in, F_out in GRAPH_CONFIGS:
+        sm    = make_random_graph_csr(N, avg_deg, seed=7)
+        A_tg  = scipy_to_tinygnn(sm)
+        A_norm= tg.gcn_norm(A_tg)  # gcn_norm adds self-loops internally
+        A_sl  = tg.add_self_loops(A_tg)
+        H_np  = np.random.default_rng(3).standard_normal((N, F_in)).astype(np.float32)
+        H_tg  = tg.Tensor.from_numpy(H_np)
+        warmup = 3 if N <= 10_000 else 1
+
+        if pyg_cls is not None:
+            torch = pyg_cls[0]
+            H_t = torch.from_numpy(H_np)
+            ei  = _pyg_edge_index(sm)
+        else:
+            H_t = ei = None
+
+        specs = [
+            ("GCN",       _gcn_weights,
+             lambda w, fi, fo: make_tg_gcn(w, fi, fo),  A_norm,
+             lambda w, fi, fo: _pyg_gcn_fwd(w, fi, fo, ei, H_t, pyg_cls)),
+            ("SAGE-Mean", _sage_weights,
+             lambda w, fi, fo: make_tg_sage(w, fi, fo, tg.SAGELayer.Aggregator.Mean), A_tg,
+             lambda w, fi, fo: _pyg_sage_fwd(w, fi, fo, ei, H_t, pyg_cls)),
+            ("SAGE-Max",  _sage_weights,
+             lambda w, fi, fo: make_tg_sage(w, fi, fo, tg.SAGELayer.Aggregator.Max),  A_tg,
+             None),
+            ("GAT",       _gat_weights,
+             lambda w, fi, fo: make_tg_gat(w, fi, fo),  A_sl,
+             lambda w, fi, fo: _pyg_gat_fwd(w, fi, fo, ei, H_t, pyg_cls)),
+        ]
+
+        for (lname, wfn, tg_builder, A_fwd, pyg_builder) in specs:
+            w  = wfn(F_in, F_out, seed=0)
+            ly = tg_builder(w, F_in, F_out)
+            def _tg(ly=ly, A=A_fwd, H=H_tg):
+                return ly.forward(A, H)
+
+            # TinyGNN 1-thread (unoptimized)
+            _omp_set_threads(1)
+            ms_1t, mb_1t = _timeit(_tg, warmup=warmup, reps=reps)
+
+            # TinyGNN N-thread (optimized)
+            _omp_set_threads(N_CORES)
+            ms_nt, mb_nt = _timeit(_tg, warmup=warmup, reps=reps)
+
+            sp_omp = ms_1t / ms_nt if ms_nt > 0 else float("nan")
+
+            # PyG
+            ms_pyg = mb_pyg = sp_pyg = float("nan")
+            if pyg_cls is not None and pyg_builder is not None:
+                pyg_fn = pyg_builder(w, F_in, F_out)
+                ms_pyg, mb_pyg = _timeit(pyg_fn, warmup=warmup, reps=reps)
+                sp_pyg = ms_pyg / ms_nt if ms_nt > 0 else float("nan")
+
+            def _add(backend, ms, mb, vs1t, vspyg, thr):
+                rows.append({
+                    "graph": label, "num_nodes": N, "avg_deg": avg_deg,
+                    "F_in": F_in, "F_out": F_out, "layer": lname,
+                    "backend": backend, "threads": thr,
+                    "time_ms": round(ms, 3), "memory_mb": round(mb, 4),
+                    "speedup_vs_1t":  round(vs1t,  3) if vs1t  == vs1t  else "",
+                    "speedup_vs_pyg": round(vspyg, 3) if vspyg == vspyg else "",
+                })
+
+            _add("TinyGNN-1T",         ms_1t,  mb_1t,  1.0,   sp_pyg, 1)
+            _add(f"TinyGNN-{N_CORES}T", ms_nt, mb_nt,  sp_omp, sp_pyg, N_CORES)
+            if ms_pyg == ms_pyg:
+                _add("PyG", ms_pyg, mb_pyg,
+                     ms_1t/ms_pyg if ms_pyg > 0 else float("nan"), 1.0, 0)
+
+            pyg_s   = f"{ms_pyg:7.2f}" if ms_pyg == ms_pyg else "    n/a"
+            vspyg_s = f"{sp_pyg:6.2f}x" if sp_pyg == sp_pyg else "    n/a"
+            print(f"{label:<13} {lname:<13} {'TinyGNN-1T':<22} {ms_1t:8.2f} {mb_1t:7.3f}   1.00x")
+            print(f"{'':13} {'':13} {f'TinyGNN-{N_CORES}T':<22} {ms_nt:8.2f} {mb_nt:7.3f} {sp_omp:6.2f}x")
+            if ms_pyg == ms_pyg:
+                print(f"{'':13} {'':13} {'PyG':<22} {ms_pyg:8.2f} {mb_pyg:7.3f}         {vspyg_s}")
+            print()
+
+    print("=" * 84)
+    return rows
+
+
+# ============================================================================
+#  CSV output
+# ============================================================================
+
+def save_csv(bench_rows: List[Dict], acc_rows: List[Dict], prefix: str):
+    os.makedirs(os.path.dirname(prefix) if os.path.dirname(prefix) else ".", exist_ok=True)
+    base = prefix.replace(".csv", "")
+
+    if bench_rows:
+        path = base + "_timing.csv"
+        fields = ["graph","num_nodes","avg_deg","F_in","F_out","layer",
+                  "backend","threads","time_ms","memory_mb",
+                  "speedup_vs_1t","speedup_vs_pyg"]
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader(); w.writerows(bench_rows)
+        print(f"  Timing CSV   -> {path}")
+
+    if acc_rows:
+        path = base + "_accuracy.csv"
+        fields = ["layer","max_diff","mean_diff","rel_diff","pass"]
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader(); w.writerows(acc_rows)
+        print(f"  Accuracy CSV -> {path}")
 
 
 # ============================================================================
@@ -437,23 +443,32 @@ def run_accuracy_checks():
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="TinyGNN GNN benchmark + accuracy checks")
-    parser.add_argument("--accuracy", action="store_true",
-                        help="Run accuracy validation against PyTorch Geometric")
-    parser.add_argument("--no-bench", action="store_true",
-                        help="Skip benchmarks (only run accuracy checks)")
-    parser.add_argument("--reps", type=int, default=10,
-                        help="Number of timed repetitions per benchmark (default: 10)")
+    parser = argparse.ArgumentParser(description="TinyGNN comprehensive GNN benchmark")
+    parser.add_argument("--reps",        type=int, default=8,
+                        help="Timed repetitions per cell (default 8)")
+    parser.add_argument("--no-bench",    action="store_true", help="Skip benchmarks")
+    parser.add_argument("--no-accuracy", action="store_true", help="Skip accuracy checks")
+    parser.add_argument("--csv",         default="benchmarks/gnn_bench_results.csv",
+                        help="CSV output prefix")
     args = parser.parse_args()
 
+    pyg = _try_pyg()
+    if pyg is None:
+        print("  NOTE: torch_geometric not found — PyG comparisons excluded.")
+
+    bench_rows: List[Dict] = []
+    acc_rows:   List[Dict] = []
+
+    if not args.no_accuracy:
+        acc_rows = run_accuracy(pyg)
+
     if not args.no_bench:
-        run_benchmarks(reps=args.reps)
+        bench_rows = run_benchmarks(reps=args.reps, pyg_cls=pyg)
 
-    if args.accuracy:
-        run_accuracy_checks()
-    elif not args.no_bench:
-        print("\n  Tip: run with --accuracy to also validate against PyTorch Geometric.")
-
+    if bench_rows or acc_rows:
+        save_csv(bench_rows, acc_rows, args.csv)
+        print()
+        print("  Run  python scripts/plot_gnn_bench.py  to generate charts.")
     print()
 
 

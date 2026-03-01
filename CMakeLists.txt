@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TinyGNN VERSION 0.1.0 LANGUAGES CXX)
+project(TinyGNN VERSION 0.1.2 LANGUAGES CXX)
 
 # ── C++17 standard ──────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
@@ -17,6 +17,10 @@ else()
     endif()
 endif()
 
+# ── Build options ──────────────────────────────────────────────────────────
+option(TINYGNN_BUILD_TESTS      "Build TinyGNN test executables"      ON)
+option(TINYGNN_BUILD_BENCHMARKS "Build TinyGNN benchmark executables" ON)
+
 # ── Core library ────────────────────────────────────────────────────────────
 add_library(tinygnn_core
     src/tensor.cpp
@@ -26,8 +30,12 @@ add_library(tinygnn_core
     src/model.cpp
 )
 
+# Namespaced alias so consumers use tinygnn::tinygnn_core
+add_library(tinygnn::tinygnn_core ALIAS tinygnn_core)
+
 target_include_directories(tinygnn_core PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
 
 # ── OpenMP (Phase 8) ───────────────────────────────────────────────────────
@@ -45,6 +53,7 @@ if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
 endif()
 
 # ── Tests ───────────────────────────────────────────────────────────────────
+if(TINYGNN_BUILD_TESTS)
 enable_testing()
 
 add_executable(test_tensor tests/test_tensor.cpp)
@@ -82,11 +91,59 @@ add_test(NAME GATTests COMMAND test_gat)
 add_executable(test_e2e tests/test_e2e.cpp)
 target_link_libraries(test_e2e PRIVATE tinygnn_core)
 add_test(NAME E2ETests COMMAND test_e2e)
+endif() # TINYGNN_BUILD_TESTS
 
-# ── Benchmark (Phase 8) ────────────────────────────────────────────────────
+# ── Benchmarks ─────────────────────────────────────────────────────────────
+if(TINYGNN_BUILD_BENCHMARKS)
 add_executable(bench_parallel benchmarks/bench_parallel.cpp)
 target_link_libraries(bench_parallel PRIVATE tinygnn_core)
 
-# ── Benchmark (Phase 9: Operator Fusion) ──────────────────────────────────
 add_executable(bench_fusion benchmarks/bench_fusion.cpp)
 target_link_libraries(bench_fusion PRIVATE tinygnn_core)
+
+add_executable(bench_datasets benchmarks/bench_datasets.cpp)
+target_link_libraries(bench_datasets PRIVATE tinygnn_core)
+endif() # TINYGNN_BUILD_BENCHMARKS
+
+# ── Installation & CMake package export ────────────────────────────────────
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+install(TARGETS tinygnn_core
+    EXPORT tinygnn-targets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Export the targets file
+install(EXPORT tinygnn-targets
+    FILE tinygnn-targets.cmake
+    NAMESPACE tinygnn::
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tinygnn
+)
+
+# Generate config + version files
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/tinygnn-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/tinygnn-config.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_DATADIR}/tinygnn
+)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/tinygnn-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/tinygnn-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/tinygnn-config-version.cmake"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tinygnn
+)
+
+# Install the license for downstream consumers
+install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/tinygnn
+    RENAME copyright
+)

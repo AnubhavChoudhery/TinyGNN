@@ -123,7 +123,7 @@ ext_modules = [
 
 setup(
     name="tinygnn",
-    version="0.1.2",
+    version="0.1.3",
     author="Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)",
     description="TinyGNN — Zero-dependency C++17 GNN inference engine with Python bindings",
     long_description=open("README.md", encoding="utf-8").read()
@@ -132,10 +132,19 @@ setup(
     long_description_content_type="text/markdown",
     url="https://github.com/JaiAnshSB/TinyGNN",
     license="MIT",
-    packages=["tinygnn"],
-    package_dir={"tinygnn": os.path.join("python", "tinygnn")},
+    packages=["tinygnn", "tinygnn.tests"],
+    package_dir={
+        "tinygnn":       os.path.join("python", "tinygnn"),
+        "tinygnn.tests": os.path.join("python", "tinygnn", "tests"),
+    },
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt},
+    entry_points={
+        "console_scripts": [
+            "tinygnn-test = tinygnn.tests.smoke_tests:_main",
+            "tinygnn-bench = scripts.bench_gnn:main",
+        ],
+    },
     python_requires=">=3.8",
     install_requires=["pybind11>=2.11", "numpy>=1.20"],
     extras_require={

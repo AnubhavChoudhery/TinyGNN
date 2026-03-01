@@ -69,7 +69,12 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Run C++ tests
+      - name: Run C++ tests (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: ctest --test-dir build --output-on-failure -j4
+
+      - name: Run C++ tests (Windows / MSVC multi-config)
+        if: runner.os == 'Windows'
         run: ctest --test-dir build --output-on-failure --config Release -j4
         # Note: test_e2e requires dataset files (skipped in CI if not present)
 

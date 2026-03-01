@@ -557,7 +557,7 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
     switch (aggregator_) {
         case Aggregator::Mean: {
             #pragma omp parallel for schedule(dynamic)
-            for (std::size_t i = 0; i < N; ++i) {
+            for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
                 const int32_t row_start = rp[i];
                 const int32_t row_end   = rp[i + 1];
                 const float deg = static_cast<float>(row_end - row_start);
@@ -605,8 +605,8 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
                 }
 
                 // Fused dual-matmul: out[i] = agg_row · W_neigh + H[i] · W_self
-                float* out_i = out_data + i * F_out;
-                const float* hi = h_data + i * F_in;
+                float* out_i = out_data + static_cast<std::size_t>(i) * F_out;
+                const float* hi = h_data + static_cast<std::size_t>(i) * F_in;
 
                 for (std::size_t fi = 0; fi < F_in; ++fi) {
                     const float a_val = agg_row[fi];
@@ -643,7 +643,7 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
                 -std::numeric_limits<float>::infinity();
 
             #pragma omp parallel for schedule(dynamic)
-            for (std::size_t i = 0; i < N; ++i) {
+            for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
                 const int32_t row_start = rp[i];
                 const int32_t row_end   = rp[i + 1];
 
@@ -662,8 +662,8 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
                 }
 
                 // Fused dual-matmul: out[i] = agg_row · W_neigh + H[i] · W_self
-                float* out_i = out_data + i * F_out;
-                const float* hi = h_data + i * F_in;
+                float* out_i = out_data + static_cast<std::size_t>(i) * F_out;
+                const float* hi = h_data + static_cast<std::size_t>(i) * F_in;
 
                 for (std::size_t fi = 0; fi < F_in; ++fi) {
                     const float a_val = agg_row[fi];
@@ -953,9 +953,9 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
     std::vector<float> dst_scores(N, 0.0f);
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < N; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
         float s = 0.0f, d = 0.0f;
-        const float* whi = wh_data + i * F_out;
+        const float* whi = wh_data + static_cast<std::size_t>(i) * F_out;
 #ifdef __AVX2__
         __m256 vs = _mm256_setzero_ps();
         __m256 vd = _mm256_setzero_ps();
@@ -1005,13 +1005,13 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
     float* out_data = out.data().data();
 
     #pragma omp parallel for schedule(dynamic)
-    for (std::size_t i = 0; i < N; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
 
         if (row_start == row_end) continue;   // isolated node
 
-        const float si = src_scores[i];
+        const float si = src_scores[static_cast<std::size_t>(i)];
         const int32_t row_len = row_end - row_start;
 
         // ── Phase A: Compute attention logits + row softmax ─────────────
@@ -1043,7 +1043,7 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
         }
 
         // ── Phase B: Attention-weighted aggregation (fused SpMM) ────────
-        float* out_i = out_data + i * F_out;
+        float* out_i = out_data + static_cast<std::size_t>(i) * F_out;
         for (int32_t idx = 0; idx < row_len; ++idx) {
             const auto j = static_cast<std::size_t>(ci[row_start + idx]);
             const float alpha = attn[static_cast<std::size_t>(idx)];

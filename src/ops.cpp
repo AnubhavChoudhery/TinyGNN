@@ -27,6 +27,15 @@
 #include <omp.h>
 #endif
 
+// ── MSVC compat: __restrict__ is a GCC/Clang extension; MSVC calls it __restrict
+#if defined(_MSC_VER) && !defined(__restrict__)
+#  define __restrict__ __restrict
+#endif
+
+// ── MSVC OpenMP 2.0 requires signed integer loop variable in parallel for ────
+// We use int64_t throughout so the same code is correct on all compilers.
+#include <cstdint>
+
 namespace tinygnn {
 
 // ============================================================================
@@ -108,9 +117,9 @@ Tensor matmul(const Tensor& A, const Tensor& B) {
     //  Inner j-loop uses AVX2 FMA intrinsics (8 floats per cycle).
     //
     #pragma omp parallel for schedule(dynamic)
-    for (std::size_t i = 0; i < M; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
         for (std::size_t k = 0; k < K; ++k) {
-            const float a_ik = a[i * K + k];
+            const float a_ik = a[static_cast<std::size_t>(i) * K + k];
             float* __restrict__ ci = c + i * N;
             const float* __restrict__ bk = b + k * N;
 
@@ -227,10 +236,10 @@ Tensor spmm(const Tensor& A, const Tensor& B) {
     //  Inner j-loop uses AVX2 FMA intrinsics.
     //
     #pragma omp parallel for schedule(dynamic)
-    for (std::size_t i = 0; i < M; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
-        float* __restrict__ crow = c + i * N;
+        float* __restrict__ crow = c + static_cast<std::size_t>(i) * N;
 
         for (int32_t nz = row_start; nz < row_end; ++nz) {
             const auto k     = static_cast<std::size_t>(ci[nz]);
@@ -296,7 +305,7 @@ void relu_inplace(Tensor& X) {
     const std::size_t n = X.data().size();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         d[i] = std::max(0.0f, d[i]);
     }
 }
@@ -323,7 +332,7 @@ void leaky_relu_inplace(Tensor& X, float alpha) {
     const std::size_t n = X.data().size();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         d[i] = d[i] >= 0.0f ? d[i] : alpha * d[i];
     }
 }
@@ -348,7 +357,7 @@ void elu_inplace(Tensor& X, float alpha) {
     const std::size_t n = X.data().size();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         if (d[i] < 0.0f) {
             d[i] = alpha * (std::exp(d[i]) - 1.0f);
         }
@@ -379,7 +388,7 @@ void sigmoid_inplace(Tensor& X) {
     const std::size_t n = X.data().size();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         if (d[i] >= 0.0f) {
             d[i] = 1.0f / (1.0f + std::exp(-d[i]));
         } else {
@@ -409,7 +418,7 @@ void tanh_inplace(Tensor& X) {
     const std::size_t n = X.data().size();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         d[i] = std::tanh(d[i]);
     }
 }
@@ -440,7 +449,7 @@ void gelu_inplace(Tensor& X) {
     constexpr float COEFF          = 0.044715f;
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < n; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(n); ++i) {
         const float x = d[i];
         const float inner = SQRT_2_OVER_PI * (x + COEFF * x * x * x);
         d[i] = 0.5f * x * (1.0f + std::tanh(inner));
@@ -485,8 +494,8 @@ void softmax_inplace(Tensor& X) {
 
     // Phase 8: parallelize over rows — each row is independent
     #pragma omp parallel for schedule(dynamic)
-    for (std::size_t i = 0; i < M; ++i) {
-        float* row = d + i * N;
+    for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
+        float* row = d + static_cast<std::size_t>(i) * N;
 
         // Pass 1: find row maximum (for numerical stability)
         float max_val = row[0];
@@ -544,8 +553,8 @@ void log_softmax_inplace(Tensor& X) {
 
     // Phase 8: parallelize over rows — each row is independent
     #pragma omp parallel for schedule(dynamic)
-    for (std::size_t i = 0; i < M; ++i) {
-        float* row = d + i * N;
+    for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
+        float* row = d + static_cast<std::size_t>(i) * N;
 
         // Pass 1: find row maximum
         float max_val = row[0];
@@ -606,9 +615,9 @@ void add_bias(Tensor& X, const Tensor& bias) {
     const float* __restrict__ b = bias.data().data();
 
     #pragma omp parallel for schedule(static)
-    for (std::size_t i = 0; i < M; ++i) {
+    for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
         for (std::size_t j = 0; j < N; ++j) {
-            x[i * N + j] += b[j];
+            x[static_cast<std::size_t>(i) * N + j] += b[j];
         }
     }
 }

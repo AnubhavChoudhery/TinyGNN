@@ -17,11 +17,21 @@ import platform
 from setuptools import setup, Extension
 from setuptools.command.build_ext import build_ext
 
-# ── Paths ────────────────────────────────────────────────────────────────────
-ROOT = os.path.dirname(os.path.abspath(__file__))
-INCLUDE_DIR = os.path.join(ROOT, "include")
-SRC_DIR = os.path.join(ROOT, "src")
-PYTHON_DIR = os.path.join(ROOT, "python")
+# ── Work around setuptools >=82 shlex.split() bug on Windows ─────────────────
+# shlex.split() treats backslashes as escape characters, mangling Windows paths
+# like "C:\msys64\ucrt64\bin\gcc.exe" → "C:msys64ucrt64bingcc.exe".
+# This triggers if CC / CXX env vars contain back-slashed paths.
+# Fix: normalise those vars to use forward slashes before setuptools sees them.
+if sys.platform == "win32":
+    for _var in ("CC", "CXX"):
+        _val = os.environ.get(_var, "")
+        if "\\" in _val:
+            os.environ[_var] = _val.replace("\\", "/")
+
+# ── Paths (relative to setup.py — required by setuptools for sdist) ──────────
+INCLUDE_DIR = "include"
+SRC_DIR = "src"
+PYTHON_DIR = "python"
 
 
 def get_pybind11_include():
@@ -47,7 +57,18 @@ cpp_sources = [
 
 
 class BuildExt(build_ext):
-    """Custom build_ext that sets C++17 and appropriate compiler flags."""
+    """Custom build_ext that sets C++17 and appropriate compiler flags.
+    
+    On Windows, auto-detects MinGW when MSVC is not available.
+    """
+
+    def initialize_options(self):
+        super().initialize_options()
+        # Auto-detect MinGW on Windows when MSVC is absent
+        if sys.platform == "win32" and self.compiler is None:
+            import shutil
+            if shutil.which("gcc") and not shutil.which("cl"):
+                self.compiler = "mingw32"
 
     def build_extensions(self):
         # Detect compiler
@@ -99,11 +120,11 @@ ext_modules = [
 
 setup(
     name="tinygnn",
-    version="0.1.0",
+    version="0.1.2",
     author="Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)",
     description="TinyGNN — Zero-dependency C++17 GNN inference engine with Python bindings",
-    long_description=open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-    if os.path.exists(os.path.join(ROOT, "README.md"))
+    long_description=open("README.md", encoding="utf-8").read()
+    if os.path.exists("README.md")
     else "",
     long_description_content_type="text/markdown",
     url="https://github.com/JaiAnshSB/TinyGNN",

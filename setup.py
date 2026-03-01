@@ -84,14 +84,17 @@ class BuildExt(build_ext):
                     "-fPIC",
                     "-DNDEBUG",
                 ]
-                # Static-link GCC runtime so .pyd doesn't depend on MinGW DLLs
-                ext.extra_link_args = [
-                    "-static-libgcc",
-                    "-static-libstdc++",
-                    "-Wl,-Bstatic",
-                    "-lwinpthread",
-                    "-Wl,-Bdynamic",
-                ]
+                if ct == "mingw32":
+                    # Static-link GCC runtime so .pyd doesn't depend on MinGW DLLs
+                    ext.extra_link_args = [
+                        "-static-libgcc",
+                        "-static-libstdc++",
+                        "-Wl,-Bstatic",
+                        "-lwinpthread",
+                        "-Wl,-Bdynamic",
+                    ]
+                else:
+                    ext.extra_link_args = []
             elif ct == "msvc":
                 ext.extra_compile_args = [
                     "/std:c++17",

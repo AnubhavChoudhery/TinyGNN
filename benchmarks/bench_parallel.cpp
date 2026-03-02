@@ -140,8 +140,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Thread counts to test
-    const std::vector<int> thread_counts = {1, 2, 4, 8};
+    // Thread counts to test — cover full range up to hw concurrency
+    const int max_hw = []() {
+#ifdef _OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }();
+    std::vector<int> thread_counts;
+    for (int t : {1, 2, 4, 8, 16, 20, 32}) {
+        if (t <= max_hw) thread_counts.push_back(t);
+    }
+    if (thread_counts.empty() || thread_counts.back() != max_hw)
+        thread_counts.push_back(max_hw);
 
     // CSV header
     std::string csv;

@@ -10,7 +10,8 @@
 #    1. cpp-build-test     — CMake build + CTest (Linux, macOS, Windows)
 #    2. python-build-test  — pip install + pytest (Linux, Windows)
 #    3. sanitizers         — ASan + UBSan memory safety checks (Linux)
-#    4. docs               — Build Doxygen + Sphinx documentation (Linux)
+#    4. valgrind           — Memcheck + Helgrind (Linux)
+#    5. docs               — Build Doxygen + Sphinx documentation (Linux)
 # =============================================================================
 
 name: CI
@@ -64,6 +65,8 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
+          # Help CMake find Homebrew libomp on macOS (arm64 and x86)
+          OpenMP_ROOT: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
@@ -75,7 +78,7 @@ jobs:
 
       - name: Run C++ tests (Windows / MSVC multi-config)
         if: runner.os == 'Windows'
-        run: ctest --test-dir build --output-on-failure --config Release -j4
+        run: ctest --test-dir build --output-on-failure -C Release -j4
         # Note: test_e2e requires dataset files (skipped in CI if not present)
 
   # ═══════════════════════════════════════════════════════════════════════════
@@ -107,7 +110,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install build dependencies
-        run: pip install pybind11 numpy setuptools wheel
+        run: pip install pybind11 numpy setuptools wheel psutil
 
       - name: Install OpenMP (macOS)
         if: runner.os == 'macOS'
@@ -115,6 +118,9 @@ jobs:
 
       - name: Build extension (Linux/macOS)
         if: runner.os != 'Windows'
+        # LIBOMP_PREFIX tells setup.py where to find Homebrew libomp headers/lib
+        env:
+          LIBOMP_PREFIX: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
         run: python setup.py build_ext --inplace
 
       - name: Build extension (Windows)
@@ -142,9 +148,12 @@ jobs:
         env:
           CC: gcc
           CXX: g++
-          CXXFLAGS: "-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          LDFLAGS: "-fsanitize=address,undefined"
-        run: cmake -S . -B build-san -DCMAKE_BUILD_TYPE=Debug
+        run: >
+          cmake -S . -B build-san
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
 
       - name: Build with sanitizers
         run: cmake --build build-san --parallel
@@ -155,7 +164,6 @@ jobs:
           UBSAN_OPTIONS: "halt_on_error=1:print_stacktrace=1"
         run: |
           cd build-san
-          # Run each test individually for clear error attribution
           for test in test_tensor test_graph_loader test_matmul test_spmm \
                       test_activations test_gcn test_graphsage test_gat; do
             echo "=== Running $test under ASan+UBSan ==="
@@ -165,7 +173,86 @@ jobs:
           echo "All sanitizer tests passed!"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  #  Job 4: Documentation Build (Doxygen + Sphinx)
+  #  Job 4: Valgrind — Memcheck + Helgrind (Linux only)
+  # ═══════════════════════════════════════════════════════════════════════════
+  valgrind:
+    name: Valgrind (Memcheck + Helgrind)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y valgrind g++ libomp-dev
+
+      - name: Build debug binaries (no -static; Valgrind needs dynamic symbols)
+        run: |
+          mkdir -p build/valgrind
+          SRCS_COMMON="src/tensor.cpp src/ops.cpp src/layers.cpp"
+          FLAGS="-std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer -Iinclude -fopenmp"
+          for test in test_tensor test_graph_loader test_matmul test_spmm \
+                      test_activations test_gcn test_graphsage test_gat; do
+            case "$test" in
+              test_tensor)      SRCS="src/tensor.cpp" ;;
+              test_graph_loader) SRCS="src/tensor.cpp src/graph_loader.cpp" ;;
+              test_matmul|test_spmm) SRCS="src/tensor.cpp src/ops.cpp" ;;
+              test_activations) SRCS="src/tensor.cpp src/ops.cpp" ;;
+              test_gcn|test_graphsage|test_gat) SRCS="src/tensor.cpp src/ops.cpp src/layers.cpp" ;;
+            esac
+            g++ $FLAGS $SRCS tests/${test}.cpp -o build/valgrind/${test}_vg -lgomp
+            echo "Built build/valgrind/${test}_vg"
+          done
+
+      - name: Memcheck (no leaks, no invalid access)
+        run: |
+          PASS=0; FAIL=0
+          mkdir -p build/valgrind/logs
+          for test in test_tensor test_graph_loader test_matmul test_spmm \
+                      test_activations test_gcn test_graphsage test_gat; do
+            echo "--- Memcheck: $test ---"
+            valgrind \
+              --tool=memcheck \
+              --leak-check=full \
+              --show-leak-kinds=all \
+              --track-origins=yes \
+              --errors-for-leak-kinds=all \
+              --error-exitcode=1 \
+              --log-file=build/valgrind/logs/memcheck_${test}.log \
+              build/valgrind/${test}_vg > /dev/null 2>&1 \
+              && { echo "  [PASS] memcheck $test"; PASS=$((PASS+1)); } \
+              || { echo "  [FAIL] memcheck $test"; cat build/valgrind/logs/memcheck_${test}.log | grep -E 'ERROR SUMMARY|definitely lost|Invalid' | head -10; FAIL=$((FAIL+1)); }
+          done
+          echo "Memcheck: $PASS passed, $FAIL failed"
+          [ $FAIL -eq 0 ]
+
+      - name: Helgrind (threading / data races)
+        run: |
+          PASS=0; FAIL=0
+          for test in test_tensor test_graph_loader test_matmul test_spmm \
+                      test_activations test_gcn test_graphsage test_gat; do
+            echo "--- Helgrind: $test ---"
+            valgrind \
+              --tool=helgrind \
+              --error-exitcode=1 \
+              --log-file=build/valgrind/logs/helgrind_${test}.log \
+              build/valgrind/${test}_vg > /dev/null 2>&1 \
+              && { echo "  [PASS] helgrind $test"; PASS=$((PASS+1)); } \
+              || { echo "  [FAIL] helgrind $test"; cat build/valgrind/logs/helgrind_${test}.log | grep -E 'ERROR SUMMARY' | head -5; FAIL=$((FAIL+1)); }
+          done
+          echo "Helgrind: $PASS passed, $FAIL failed"
+          [ $FAIL -eq 0 ]
+
+      - name: Upload Valgrind logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: valgrind-logs
+          path: build/valgrind/logs/
+          retention-days: 14
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  #  Job 5: Documentation Build (Doxygen + Sphinx)
   # ═══════════════════════════════════════════════════════════════════════════
   docs:
     name: Documentation

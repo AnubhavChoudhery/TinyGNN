@@ -52,11 +52,26 @@ GRAPH_N     = {"small-1K": 1_000, "medium-10K": 10_000, "large-100K": 100_000}
 # ============================================================================
 
 def _read_timing(path: Path) -> List[Dict]:
+    """Read timing CSV, normalising any TinyGNN-<N>T (N>1) → TinyGNN-NT.
+
+    The bench script names the multi-thread backend after the host core count
+    (e.g. TinyGNN-20T on a 20-core machine).  Normalise to a stable label so
+    plot functions don't need to know the exact thread count.
+    """
+    import re
     if not path.exists():
         print(f"  [WARN] Timing CSV not found: {path}")
         return []
+    _nt_re = re.compile(r'^TinyGNN-(\d+)T$')
+    rows = []
     with open(path, newline="") as f:
-        return list(csv.DictReader(f))
+        for row in csv.DictReader(f):
+            m = _nt_re.match(row.get("backend", ""))
+            if m and int(m.group(1)) > 1:
+                row = dict(row)          # don't mutate original
+                row["backend"] = "TinyGNN-NT"
+            rows.append(row)
+    return rows
 
 
 def _read_accuracy(path: Path) -> List[Dict]:
@@ -96,12 +111,9 @@ def plot_runtime_comparison(rows: List[Dict], out: Path):
         width   = 0.25
 
         for bi, (bname, color) in enumerate([
-            ("TinyGNN-1T", C_1T), ("TinyGNN-16T", C_NT), ("PyG", C_PyG)
+            ("TinyGNN-1T", C_1T), ("TinyGNN-NT", C_NT), ("PyG", C_PyG)
         ]):
-            vals = [data[graph][l].get(bname, data[graph][l].get("PyG", float("nan")))
-                    if bname == "PyG" else data[graph][l].get(bname, float("nan"))
-                    for l in layers]
-            mask  = [not (v != v) for v in vals]
+            vals = [data[graph][l].get(bname, float("nan")) for l in layers]
             xpos  = x + (bi - 1) * width
             bars  = ax.bar(xpos, [v if v == v else 0 for v in vals],
                            width, label=bname if graph == GRAPH_ORDER[0] else "",
@@ -120,7 +132,8 @@ def plot_runtime_comparison(rows: List[Dict], out: Path):
         plt.Rectangle((0,0), 1, 1, color=C_NT),
         plt.Rectangle((0,0), 1, 1, color=C_PyG),
     ]
-    fig.legend(handles, ["TinyGNN-1T (unoptimized)", "TinyGNN-NT (optimized)", "PyG"],
+    nt_label = f"TinyGNN-NT (multi-thread, AVX2)"
+    fig.legend(handles, ["TinyGNN-1T (single-thread)", nt_label, "PyG"],
                loc="upper center", ncol=3, fontsize=9, framealpha=0.9,
                bbox_to_anchor=(0.5, 1.02))
     fig.suptitle("GNN Inference Runtime: TinyGNN vs PyTorch Geometric", fontsize=12, y=1.06)
@@ -149,9 +162,11 @@ def plot_memory_comparison(rows: List[Dict], out: Path):
         width = 0.25
 
         for bi, (bname, color) in enumerate([
-            ("TinyGNN-1T", C_1T), ("TinyGNN-16T", C_NT), ("PyG", C_PyG)
+            ("TinyGNN-1T", C_1T), ("TinyGNN-NT", C_NT), ("PyG", C_PyG)
         ]):
-            vals = [data[graph][l].get(bname, float("nan")) for l in LAYER_ORDER]
+            # Convert MB → KB for readability
+            vals = [data[graph][l].get(bname, float("nan")) * 1024.0
+                    for l in LAYER_ORDER]
             ax.bar(x + (bi - 1) * width,
                    [v if v == v else 0 for v in vals],
                    width, color=color, edgecolor="white", linewidth=0.6)
@@ -159,7 +174,9 @@ def plot_memory_comparison(rows: List[Dict], out: Path):
         ax.set_title(f"{graph}\n({GRAPH_N[graph]:,} nodes)", fontsize=10)
         ax.set_xticks(x)
         ax.set_xticklabels(LAYER_ORDER, rotation=20, ha="right", fontsize=9)
-        ax.set_ylabel("Peak memory (MB)" if graph == GRAPH_ORDER[0] else "")
+        ax.set_ylabel("Working-set memory (KB)" if graph == GRAPH_ORDER[0] else "")
+        ax.set_yscale("log")   # log scale so different graph sizes are distinguishable
+        ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
         ax.grid(axis="y", linestyle="--", alpha=0.5)
         ax.set_axisbelow(True)
 
@@ -171,7 +188,8 @@ def plot_memory_comparison(rows: List[Dict], out: Path):
     fig.legend(handles, ["TinyGNN-1T", "TinyGNN-NT", "PyG"],
                loc="upper center", ncol=3, fontsize=9,
                bbox_to_anchor=(0.5, 1.02))
-    fig.suptitle("GNN Peak Memory: TinyGNN vs PyTorch Geometric", fontsize=12, y=1.06)
+    fig.suptitle("GNN Working-Set Memory: TinyGNN vs PyTorch Geometric  (analytical, log scale)",
+                 fontsize=12, y=1.06)
     fig.tight_layout()
     fig.savefig(out, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -264,19 +282,13 @@ def plot_scaling(rows: List[Dict], out: Path):
     fig, axes = plt.subplots(1, len(LAYER_ORDER), figsize=(16, 4), sharey=False)
     style = {
         "TinyGNN-1T":  dict(color=C_1T,  ls="--", marker="s", ms=6),
-        "TinyGNN-16T": dict(color=C_NT,  ls="-",  marker="o", ms=6),
+        "TinyGNN-NT": dict(color=C_NT,  ls="-",  marker="o", ms=6),
         "PyG":         dict(color=C_PyG, ls="-.", marker="^", ms=6),
     }
 
     for ax, layer in zip(axes, LAYER_ORDER):
-        for b in ["TinyGNN-1T", "TinyGNN-16T", "PyG"]:
+        for b in ["TinyGNN-1T", "TinyGNN-NT", "PyG"]:
             pts = sorted(times[layer].get(b, []))
-            # Try any NT variant
-            if not pts and b == "TinyGNN-16T":
-                for k in times[layer]:
-                    if k.startswith("TinyGNN-") and k != "TinyGNN-1T":
-                        pts = sorted(times[layer][k])
-                        break
             if not pts:
                 continue
             xs = [p[0] for p in pts]

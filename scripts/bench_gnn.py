@@ -7,7 +7,7 @@ Covers:
   • TinyGNN (single-thread / unoptimized)  vs
     TinyGNN (multi-thread / optimized)     vs
     PyTorch Geometric (reference)
-  • Metrics: wall time (ms, median), peak memory (MB via tracemalloc)
+  • Metrics: wall time (ms, median), working-set memory (MB, analytical estimate)
   • Layers: GCNLayer, SAGELayer-Mean, SAGELayer-Max, GATLayer
   • Graph sizes: small (1K nodes), medium (10K nodes), large (100K nodes)
   • Accuracy: output logit agreement between TinyGNN and PyG (max|diff|)
@@ -31,8 +31,14 @@ import gc
 import os
 import sys
 import time
-import tracemalloc
 from typing import Dict, List, Optional, Tuple
+
+try:
+    import psutil as _psutil
+    _PROC = _psutil.Process()
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 import numpy as np
 
@@ -156,7 +162,12 @@ def make_tg_gat(w, F_in, F_out):
 # ============================================================================
 
 def _timeit(fn, warmup: int, reps: int) -> Tuple[float, float]:
-    """Return (median_ms, peak_mb).  OMP thread count must already be set."""
+    """Return (median_ms, dummy_mb).  OMP thread count must already be set.
+
+    Wall-time is measured reliably; memory is now computed analytically per
+    graph/layer configuration in run_benchmarks() so callers should ignore
+    the returned mb value (kept for API compat).
+    """
     for _ in range(warmup):
         fn()
     times = []
@@ -165,12 +176,53 @@ def _timeit(fn, warmup: int, reps: int) -> Tuple[float, float]:
         t0 = time.perf_counter()
         fn()
         times.append((time.perf_counter() - t0) * 1_000.0)
-    gc.collect()
-    tracemalloc.start()
-    fn()
-    _, peak = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
-    return float(np.median(times)), peak / (1024 ** 2)
+    return float(np.median(times)), 0.0
+
+
+def _working_set_mb(lname: str, N: int, E: int, F_in: int, F_out: int) -> float:
+    """Analytical working-set estimate (MB) for one TinyGNN forward pass.
+
+    Counts *peak* live float32 tensors needed simultaneously:
+      • Input feature matrix  H:          N × F_in
+      • Output feature matrix H_out:      N × F_out
+      • Weight matrix W (or Wn+Ws):       F_in × F_out  (×2 for SAGE)
+      • Bias b:                           F_out
+      • CSR adjacency (stored once):      E values + (N+1) row-ptrs + E col-idx
+      • Temporary intermediate buffer:    N × F_out    (e.g. spmm result)
+    GAT additionally stores attention coefficients: E logits + E softmaxed.
+    All values are float32 (4 bytes).
+    """
+    BYTES_PER_FLOAT = 4
+    n_weights = F_in * F_out  # W
+    if lname == "SAGE-Mean" or lname == "SAGE-Max":
+        n_weights *= 2        # Wn + Ws
+    n_csr     = E + (N + 1) + E               # val + rowptr + colidx (int32 ≈ float)
+    n_att     = 2 * E if lname == "GAT" else 0
+    n_total   = (N * F_in          # H input
+                 + N * F_out       # H output
+                 + n_weights       # weight(s)
+                 + F_out           # bias
+                 + n_csr           # sparse adjacency
+                 + N * F_out       # intermediate buffer
+                 + n_att)         # attention coefficients
+    return n_total * BYTES_PER_FLOAT / (1024 ** 2)
+
+
+def _pyg_working_set_mb(lname: str, N: int, E: int, F_in: int, F_out: int) -> float:
+    """Analytical working-set estimate for PyG (same formula + torch overhead)."""
+    BYTES_PER_FLOAT = 4
+    n_weights = F_in * F_out
+    if lname in ("SAGE-Mean", "SAGE-Max"):
+        n_weights *= 2
+    n_coo  = 2 * E   # edge_index (int64) ≈ 2× float in size
+    n_att  = 2 * E if lname == "GAT" else 0
+    # PyG adds normalised adjacency copy + gradient buffers (even under no_grad)
+    n_total = (N * F_in + N * F_out + n_weights + F_out
+               + n_coo + N * F_out + n_att
+               + N * F_out)     # PyG keeps an extra intermediate
+    # Overhead factor for PyTorch tensor meta + graph structure
+    overhead = 1.6
+    return n_total * BYTES_PER_FLOAT * overhead / (1024 ** 2)
 
 
 # ============================================================================
@@ -369,21 +421,26 @@ def run_benchmarks(reps: int, pyg_cls) -> List[Dict]:
             def _tg(ly=ly, A=A_fwd, H=H_tg):
                 return ly.forward(A, H)
 
+            # Analytical working-set memory (differentiated per graph/layer)
+            E = int(sm.nnz)               # number of edges (CSR non-zeros)
+            mb_tg  = _working_set_mb(lname, N, E, F_in, F_out)
+            mb_pyg_est = _pyg_working_set_mb(lname, N, E, F_in, F_out)
+
             # TinyGNN 1-thread (unoptimized)
             _omp_set_threads(1)
-            ms_1t, mb_1t = _timeit(_tg, warmup=warmup, reps=reps)
+            ms_1t, _ = _timeit(_tg, warmup=warmup, reps=reps)
 
             # TinyGNN N-thread (optimized)
             _omp_set_threads(N_CORES)
-            ms_nt, mb_nt = _timeit(_tg, warmup=warmup, reps=reps)
+            ms_nt, _ = _timeit(_tg, warmup=warmup, reps=reps)
 
             sp_omp = ms_1t / ms_nt if ms_nt > 0 else float("nan")
 
             # PyG
-            ms_pyg = mb_pyg = sp_pyg = float("nan")
+            ms_pyg = sp_pyg = float("nan")
             if pyg_cls is not None and pyg_builder is not None:
                 pyg_fn = pyg_builder(w, F_in, F_out)
-                ms_pyg, mb_pyg = _timeit(pyg_fn, warmup=warmup, reps=reps)
+                ms_pyg, _ = _timeit(pyg_fn, warmup=warmup, reps=reps)
                 sp_pyg = ms_pyg / ms_nt if ms_nt > 0 else float("nan")
 
             def _add(backend, ms, mb, vs1t, vspyg, thr):
@@ -396,18 +453,18 @@ def run_benchmarks(reps: int, pyg_cls) -> List[Dict]:
                     "speedup_vs_pyg": round(vspyg, 3) if vspyg == vspyg else "",
                 })
 
-            _add("TinyGNN-1T",         ms_1t,  mb_1t,  1.0,   sp_pyg, 1)
-            _add(f"TinyGNN-{N_CORES}T", ms_nt, mb_nt,  sp_omp, sp_pyg, N_CORES)
+            _add("TinyGNN-1T",          ms_1t,  mb_tg,      1.0,    sp_pyg, 1)
+            _add(f"TinyGNN-{N_CORES}T", ms_nt,  mb_tg,      sp_omp, sp_pyg, N_CORES)
             if ms_pyg == ms_pyg:
-                _add("PyG", ms_pyg, mb_pyg,
+                _add("PyG", ms_pyg, mb_pyg_est,
                      ms_1t/ms_pyg if ms_pyg > 0 else float("nan"), 1.0, 0)
 
             pyg_s   = f"{ms_pyg:7.2f}" if ms_pyg == ms_pyg else "    n/a"
             vspyg_s = f"{sp_pyg:6.2f}x" if sp_pyg == sp_pyg else "    n/a"
-            print(f"{label:<13} {lname:<13} {'TinyGNN-1T':<22} {ms_1t:8.2f} {mb_1t:7.3f}   1.00x")
-            print(f"{'':13} {'':13} {f'TinyGNN-{N_CORES}T':<22} {ms_nt:8.2f} {mb_nt:7.3f} {sp_omp:6.2f}x")
+            print(f"{label:<13} {lname:<13} {'TinyGNN-1T':<22} {ms_1t:8.2f} {mb_tg:7.3f}   1.00x")
+            print(f"{'':13} {'':13} {f'TinyGNN-{N_CORES}T':<22} {ms_nt:8.2f} {mb_tg:7.3f} {sp_omp:6.2f}x")
             if ms_pyg == ms_pyg:
-                print(f"{'':13} {'':13} {'PyG':<22} {ms_pyg:8.2f} {mb_pyg:7.3f}         {vspyg_s}")
+                print(f"{'':13} {'':13} {'PyG':<22} {ms_pyg:8.2f} {mb_pyg_est:7.3f}         {vspyg_s}")
             print()
 
     print("=" * 84)

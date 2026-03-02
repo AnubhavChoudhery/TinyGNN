@@ -39,6 +39,25 @@ target_include_directories(tinygnn_core PUBLIC
 )
 
 # ── OpenMP (Phase 8) ───────────────────────────────────────────────────────
+# Apple clang does not bundle OpenMP.  Provide Homebrew libomp hints so that
+# find_package(OpenMP) succeeds on macOS CI (arm64 /opt/homebrew, x86 /usr/local).
+if(APPLE)
+    foreach(_libomp_prefix
+            "$ENV{OpenMP_ROOT}"
+            "/opt/homebrew/opt/libomp"
+            "/usr/local/opt/libomp")
+        if(EXISTS "${_libomp_prefix}/lib/libomp.dylib")
+            set(OpenMP_CXX_FLAGS     "-Xpreprocessor -fopenmp" CACHE STRING "" FORCE)
+            set(OpenMP_CXX_LIB_NAMES "omp"                     CACHE STRING "" FORCE)
+            set(OpenMP_omp_LIBRARY   "${_libomp_prefix}/lib/libomp.dylib"
+                                                              CACHE STRING "" FORCE)
+            list(APPEND CMAKE_REQUIRED_INCLUDES "${_libomp_prefix}/include")
+            include_directories("${_libomp_prefix}/include")
+            break()
+        endif()
+    endforeach()
+endif()
+
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(tinygnn_core PUBLIC OpenMP::OpenMP_CXX)

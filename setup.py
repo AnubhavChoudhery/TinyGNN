@@ -34,6 +34,18 @@ SRC_DIR = "src"
 PYTHON_DIR = "python"
 
 
+def _is_x86_arch() -> bool:
+    machine = platform.machine().lower()
+    return machine in {"x86_64", "amd64", "x86", "i386", "i686"}
+
+
+def _detect_libomp_prefix() -> str:
+    for prefix in ("/opt/homebrew/opt/libomp", "/usr/local/opt/libomp"):
+        if os.path.isdir(prefix):
+            return prefix
+    return ""
+
+
 def get_pybind11_include():
     """Get pybind11 include path."""
     try:
@@ -83,12 +95,14 @@ class BuildExt(build_ext):
                     "-Wextra",
                     "-fPIC",
                     "-DNDEBUG",
-                    "-fopenmp",
-                    "-mavx2",
-                    "-mfma",
                 ]
+
+                if _is_x86_arch() and sys.platform != "darwin":
+                    ext.extra_compile_args += ["-mavx2", "-mfma"]
+
                 if ct == "mingw32":
                     # Static-link GCC runtime so .pyd doesn't depend on MinGW DLLs
+                    ext.extra_compile_args.append("-fopenmp")
                     ext.extra_link_args = [
                         "-static-libgcc",
                         "-static-libstdc++",
@@ -98,7 +112,23 @@ class BuildExt(build_ext):
                         "-Wl,-Bdynamic",
                     ]
                 else:
-                    ext.extra_link_args = ["-fopenmp"]
+                    if sys.platform == "darwin":
+                        # Apple clang needs libomp from Homebrew and uses
+                        # -Xpreprocessor -fopenmp instead of plain -fopenmp.
+                        ext.extra_compile_args += ["-Xpreprocessor", "-fopenmp"]
+                        libomp_prefix = os.environ.get("LIBOMP_PREFIX", "") or _detect_libomp_prefix()
+                        if libomp_prefix:
+                            ext.include_dirs.append(os.path.join(libomp_prefix, "include"))
+                            ext.extra_link_args = [
+                                f"-L{os.path.join(libomp_prefix, 'lib')}",
+                                "-lomp",
+                                f"-Wl,-rpath,{os.path.join(libomp_prefix, 'lib')}",
+                            ]
+                        else:
+                            ext.extra_link_args = ["-lomp"]
+                    else:
+                        ext.extra_compile_args.append("-fopenmp")
+                        ext.extra_link_args = ["-fopenmp"]
             elif ct == "msvc":
                 ext.extra_compile_args = [
                     "/std:c++17",
@@ -107,8 +137,9 @@ class BuildExt(build_ext):
                     "/DNDEBUG",
                     "/EHsc",
                     "/openmp",
-                    "/arch:AVX2",
                 ]
+                if _is_x86_arch():
+                    ext.extra_compile_args.append("/arch:AVX2")
                 ext.extra_link_args = []
 
         build_ext.build_extensions(self)
@@ -129,15 +160,6 @@ ext_modules = [
 
 setup(
     name="tinygnn",
-    version="0.1.3",
-    author="Jai Ansh Singh Bindra and Anubhav Choudhery (under JBAC EdTech)",
-    description="TinyGNN — Zero-dependency C++17 GNN inference engine with Python bindings",
-    long_description=open("README.md", encoding="utf-8").read()
-    if os.path.exists("README.md")
-    else "",
-    long_description_content_type="text/markdown",
-    url="https://github.com/JaiAnshSB/TinyGNN",
-    license="MIT",
     packages=["tinygnn", "tinygnn.tests"],
     package_dir={
         "tinygnn":       os.path.join("python", "tinygnn"),
@@ -150,12 +172,6 @@ setup(
             "tinygnn-test = tinygnn.tests.smoke_tests:_main",
             "tinygnn-bench = scripts.bench_gnn:main",
         ],
-    },
-    python_requires=">=3.8",
-    install_requires=["pybind11>=2.11", "numpy>=1.20"],
-    extras_require={
-        "test": ["pytest", "scipy", "torch"],
-        "pyg": ["torch_geometric"],
     },
     zip_safe=False,
 )

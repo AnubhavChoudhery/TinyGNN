@@ -9,6 +9,7 @@ description = "TinyGNN — A zero-dependency C++17 inference engine for Sparse G
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.8"
+dynamic = ["scripts"]
 authors = [
     {name = "Jai Ansh Singh Bindra"},
     {name = "Anubhav Choudhery"},

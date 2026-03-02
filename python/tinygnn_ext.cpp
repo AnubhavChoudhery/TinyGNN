@@ -23,6 +23,9 @@
 // ============================================================================
 
 #include <pybind11/pybind11.h>
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
@@ -429,4 +432,21 @@ PYBIND11_MODULE(_tinygnn_core, m) {
         .def_static("load", &GraphLoader::load,
                     "Load graph from CSV edge + feature files",
                     py::arg("edges_path"), py::arg("features_path"));
+
+    // ── OpenMP thread control ──────────────────────────────────────────────
+    m.def("set_num_threads", [](int n) {
+#ifdef _OPENMP
+        omp_set_num_threads(n);
+#else
+        (void)n;
+#endif
+    }, "Set number of OpenMP threads", py::arg("n"));
+
+    m.def("get_max_threads", []() -> int {
+#ifdef _OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }, "Get maximum number of OpenMP threads");
 }

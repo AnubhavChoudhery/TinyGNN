@@ -47,6 +47,9 @@ import _tinygnn_core as tg
 # ── OpenMP thread control ─────────────────────────────────────────────────────
 def _make_omp_setter():
     """Return callable (n: int)->None that changes OMP thread count at runtime."""
+    # First try: use tg.set_num_threads (works with statically-linked libgomp)
+    if hasattr(tg, 'set_num_threads'):
+        return tg.set_num_threads
     for lib_name in ["libgomp-1.dll", "libgomp.so.1", "libgomp.so",
                      "libiomp5.dll", "libiomp5.so", "libomp.dylib", "libomp.so"]:
         try:

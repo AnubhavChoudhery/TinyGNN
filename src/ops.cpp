@@ -113,10 +113,11 @@ Tensor matmul(const Tensor& A, const Tensor& B) {
 
     // ── Core GEMM: loop order (i, k, j) ─────────────────────────────────────
     //
-    //  Phase 8: outer i-loop is parallelised with OpenMP.
-    //  Inner j-loop uses AVX2 FMA intrinsics (8 floats per cycle).
+    //  Phase 8+: outer i-loop parallelised with OpenMP (static schedule —
+    //  all rows have equal work in dense GEMM).
+    //  Inner j-loop: 4× unrolled AVX2 FMA to hide latency and increase ILP.
     //
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
         for (std::size_t k = 0; k < K; ++k) {
             const float a_ik = a[static_cast<std::size_t>(i) * K + k];
@@ -124,16 +125,28 @@ Tensor matmul(const Tensor& A, const Tensor& B) {
             const float* __restrict__ bk = b + k * N;
 
 #ifdef __AVX2__
-            // AVX2 path: 8-wide FMA
             const __m256 va = _mm256_set1_ps(a_ik);
             std::size_t j = 0;
+            // 4× unrolled: process 32 floats per iteration
+            for (; j + 32 <= N; j += 32) {
+                __m256 vc0 = _mm256_loadu_ps(ci + j);
+                __m256 vc1 = _mm256_loadu_ps(ci + j + 8);
+                __m256 vc2 = _mm256_loadu_ps(ci + j + 16);
+                __m256 vc3 = _mm256_loadu_ps(ci + j + 24);
+                vc0 = _mm256_fmadd_ps(va, _mm256_loadu_ps(bk + j), vc0);
+                vc1 = _mm256_fmadd_ps(va, _mm256_loadu_ps(bk + j + 8), vc1);
+                vc2 = _mm256_fmadd_ps(va, _mm256_loadu_ps(bk + j + 16), vc2);
+                vc3 = _mm256_fmadd_ps(va, _mm256_loadu_ps(bk + j + 24), vc3);
+                _mm256_storeu_ps(ci + j, vc0);
+                _mm256_storeu_ps(ci + j + 8, vc1);
+                _mm256_storeu_ps(ci + j + 16, vc2);
+                _mm256_storeu_ps(ci + j + 24, vc3);
+            }
             for (; j + 8 <= N; j += 8) {
                 __m256 vc = _mm256_loadu_ps(ci + j);
-                __m256 vb = _mm256_loadu_ps(bk + j);
-                vc = _mm256_fmadd_ps(va, vb, vc);
+                vc = _mm256_fmadd_ps(va, _mm256_loadu_ps(bk + j), vc);
                 _mm256_storeu_ps(ci + j, vc);
             }
-            // Scalar tail
             for (; j < N; ++j) {
                 ci[j] += a_ik * bk[j];
             }
@@ -231,11 +244,12 @@ Tensor spmm(const Tensor& A, const Tensor& B) {
 
     // ── Core CSR-SpMM ────────────────────────────────────────────────────────
     //
-    //  Phase 8: outer i-loop parallelised with OpenMP (schedule(dynamic)
-    //  because row lengths vary widely in power-law graphs).
-    //  Inner j-loop uses AVX2 FMA intrinsics.
+    //  Phase 8+: outer i-loop parallelised with OpenMP (schedule(dynamic, 64)
+    //  because row lengths vary widely in power-law graphs; chunk=64 to
+    //  amortise scheduler overhead).
+    //  Inner j-loop: 4× unrolled AVX2 FMA.
     //
-    #pragma omp parallel for schedule(dynamic)
+    #pragma omp parallel for schedule(dynamic, 64)
     for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
@@ -249,10 +263,23 @@ Tensor spmm(const Tensor& A, const Tensor& B) {
 #ifdef __AVX2__
             const __m256 va = _mm256_set1_ps(a_val);
             std::size_t j = 0;
+            for (; j + 32 <= N; j += 32) {
+                __m256 vc0 = _mm256_loadu_ps(crow + j);
+                __m256 vc1 = _mm256_loadu_ps(crow + j + 8);
+                __m256 vc2 = _mm256_loadu_ps(crow + j + 16);
+                __m256 vc3 = _mm256_loadu_ps(crow + j + 24);
+                vc0 = _mm256_fmadd_ps(va, _mm256_loadu_ps(brow + j), vc0);
+                vc1 = _mm256_fmadd_ps(va, _mm256_loadu_ps(brow + j + 8), vc1);
+                vc2 = _mm256_fmadd_ps(va, _mm256_loadu_ps(brow + j + 16), vc2);
+                vc3 = _mm256_fmadd_ps(va, _mm256_loadu_ps(brow + j + 24), vc3);
+                _mm256_storeu_ps(crow + j, vc0);
+                _mm256_storeu_ps(crow + j + 8, vc1);
+                _mm256_storeu_ps(crow + j + 16, vc2);
+                _mm256_storeu_ps(crow + j + 24, vc3);
+            }
             for (; j + 8 <= N; j += 8) {
                 __m256 vc = _mm256_loadu_ps(crow + j);
-                __m256 vb = _mm256_loadu_ps(brow + j);
-                vc = _mm256_fmadd_ps(va, vb, vc);
+                vc = _mm256_fmadd_ps(va, _mm256_loadu_ps(brow + j), vc);
                 _mm256_storeu_ps(crow + j, vc);
             }
             for (; j < N; ++j) {
@@ -616,9 +643,20 @@ void add_bias(Tensor& X, const Tensor& bias) {
 
     #pragma omp parallel for schedule(static)
     for (int64_t i = 0; i < static_cast<int64_t>(M); ++i) {
-        for (std::size_t j = 0; j < N; ++j) {
-            x[static_cast<std::size_t>(i) * N + j] += b[j];
+        float* __restrict__ xi = x + static_cast<std::size_t>(i) * N;
+#ifdef __AVX2__
+        std::size_t j = 0;
+        for (; j + 8 <= N; j += 8) {
+            __m256 vx = _mm256_loadu_ps(xi + j);
+            __m256 vb = _mm256_loadu_ps(b + j);
+            _mm256_storeu_ps(xi + j, _mm256_add_ps(vx, vb));
         }
+        for (; j < N; ++j) xi[j] += b[j];
+#else
+        for (std::size_t j = 0; j < N; ++j) {
+            xi[j] += b[j];
+        }
+#endif
     }
 }
 

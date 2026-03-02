@@ -90,7 +90,8 @@ add_test(NAME GATTests COMMAND test_gat)
 
 add_executable(test_e2e tests/test_e2e.cpp)
 target_link_libraries(test_e2e PRIVATE tinygnn_core)
-add_test(NAME E2ETests COMMAND test_e2e)
+add_test(NAME E2ETests COMMAND test_e2e
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif() # TINYGNN_BUILD_TESTS
 
 # ── Benchmarks ─────────────────────────────────────────────────────────────

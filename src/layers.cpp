@@ -166,27 +166,32 @@ Tensor gcn_norm(const Tensor& A) {
     const auto& ci       = A_hat.col_ind();
     const auto& vals     = A_hat.data();
 
-    // Step 2: compute degree d̃[i] = Σ_j Ã[i][j]
+    // Step 2: compute degree d̃[i] = Σ_j Ã[i][j]  (OpenMP)
     std::vector<float> deg(N, 0.0f);
-    for (std::size_t i = 0; i < N; ++i) {
-        for (int32_t nz = rp[i]; nz < rp[i + 1]; ++nz) {
-            deg[i] += vals[nz];
+    #pragma omp parallel for schedule(static)
+    for (int64_t ii = 0; ii < static_cast<int64_t>(N); ++ii) {
+        float d = 0.0f;
+        for (int32_t nz = rp[ii]; nz < rp[ii + 1]; ++nz) {
+            d += vals[nz];
         }
+        deg[static_cast<std::size_t>(ii)] = d;
     }
 
     // Step 3: deg_inv_sqrt[i] = 1 / √deg[i]
     std::vector<float> deg_inv_sqrt(N);
-    for (std::size_t i = 0; i < N; ++i) {
-        deg_inv_sqrt[i] = (deg[i] > 0.0f)
-                          ? (1.0f / std::sqrt(deg[i]))
+    #pragma omp parallel for schedule(static)
+    for (int64_t ii = 0; ii < static_cast<int64_t>(N); ++ii) {
+        deg_inv_sqrt[ii] = (deg[ii] > 0.0f)
+                          ? (1.0f / std::sqrt(deg[ii]))
                           : 0.0f;
     }
 
-    // Step 4: scale each non-zero  Â[i][j] = Ã[i][j] * dis[i] * dis[j]
+    // Step 4: scale each non-zero  Â[i][j] = Ã[i][j] * dis[i] * dis[j]  (OpenMP)
     std::vector<float> new_vals(vals.size());
-    for (std::size_t i = 0; i < N; ++i) {
-        const float dis_i = deg_inv_sqrt[i];
-        for (int32_t nz = rp[i]; nz < rp[i + 1]; ++nz) {
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t ii = 0; ii < static_cast<int64_t>(N); ++ii) {
+        const float dis_i = deg_inv_sqrt[static_cast<std::size_t>(ii)];
+        for (int32_t nz = rp[ii]; nz < rp[ii + 1]; ++nz) {
             const auto j = static_cast<std::size_t>(ci[nz]);
             new_vals[nz] = vals[nz] * dis_i * deg_inv_sqrt[j];
         }
@@ -377,7 +382,9 @@ Tensor sage_max_aggregate(const Tensor& A, const Tensor& H) {
 
     constexpr float NEG_INF = -std::numeric_limits<float>::infinity();
 
-    for (std::size_t i = 0; i < N; ++i) {
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t ii = 0; ii < static_cast<int64_t>(N); ++ii) {
+        const auto i = static_cast<std::size_t>(ii);
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
 
@@ -388,6 +395,27 @@ Tensor sage_max_aggregate(const Tensor& A, const Tensor& H) {
 
         // Initialize row to -inf, then take max over neighbors
         float* ri = r_data + i * F;
+#ifdef __AVX2__
+        {
+            const __m256 vinf = _mm256_set1_ps(NEG_INF);
+            std::size_t f = 0;
+            for (; f + 8 <= F; f += 8)
+                _mm256_storeu_ps(ri + f, vinf);
+            for (; f < F; ++f) ri[f] = NEG_INF;
+        }
+
+        for (int32_t nz = row_start; nz < row_end; ++nz) {
+            const auto j = static_cast<std::size_t>(ci[nz]);
+            const float* hj = h_data + j * F;
+            std::size_t f = 0;
+            for (; f + 8 <= F; f += 8) {
+                __m256 vr = _mm256_loadu_ps(ri + f);
+                __m256 vh = _mm256_loadu_ps(hj + f);
+                _mm256_storeu_ps(ri + f, _mm256_max_ps(vr, vh));
+            }
+            for (; f < F; ++f) ri[f] = std::max(ri[f], hj[f]);
+        }
+#else
         for (std::size_t f = 0; f < F; ++f) {
             ri[f] = NEG_INF;
         }
@@ -400,6 +428,7 @@ Tensor sage_max_aggregate(const Tensor& A, const Tensor& H) {
                 ri[f] = std::max(ri[f], hj[f]);
             }
         }
+#endif
     }
 
     return result;
@@ -556,14 +585,17 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
 
     switch (aggregator_) {
         case Aggregator::Mean: {
-            #pragma omp parallel for schedule(dynamic)
+            #pragma omp parallel
+            {
+            std::vector<float> agg_row(F_in);
+            #pragma omp for schedule(dynamic, 64)
             for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
                 const int32_t row_start = rp[i];
                 const int32_t row_end   = rp[i + 1];
                 const float deg = static_cast<float>(row_end - row_start);
 
-                // Per-row aggregation buffer (lives on each thread's stack)
-                std::vector<float> agg_row(F_in, 0.0f);
+                // Reset per-row aggregation buffer
+                std::fill(agg_row.begin(), agg_row.end(), 0.0f);
 
                 // Accumulate neighbor features
                 for (int32_t nz = row_start; nz < row_end; ++nz) {
@@ -636,19 +668,23 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
 #endif
                 }
             }
+            } // omp parallel
             break;
         }
         case Aggregator::Max: {
             constexpr float NEG_INF =
                 -std::numeric_limits<float>::infinity();
 
-            #pragma omp parallel for schedule(dynamic)
+            #pragma omp parallel
+            {
+            std::vector<float> agg_row(F_in);
+            #pragma omp for schedule(dynamic, 64)
             for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
                 const int32_t row_start = rp[i];
                 const int32_t row_end   = rp[i + 1];
 
-                // Per-row max aggregation buffer
-                std::vector<float> agg_row(F_in, 0.0f);
+                // Reset per-row max aggregation buffer
+                std::fill(agg_row.begin(), agg_row.end(), 0.0f);
 
                 if (row_start < row_end) {
                     std::fill(agg_row.begin(), agg_row.end(), NEG_INF);
@@ -693,6 +729,7 @@ Tensor SAGELayer::forward(const Tensor& A, const Tensor& H) const {
 #endif
                 }
             }
+            } // omp parallel
             break;
         }
     }
@@ -743,7 +780,9 @@ Tensor edge_softmax(const Tensor& A) {
     // New values for the softmax-normalized CSR
     std::vector<float> new_vals(nnz);
 
-    for (std::size_t i = 0; i < N; ++i) {
+    #pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t ii = 0; ii < static_cast<int64_t>(N); ++ii) {
+        const auto i = static_cast<std::size_t>(ii);
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
 
@@ -1004,7 +1043,16 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
     Tensor out = Tensor::dense(N, F_out);
     float* out_data = out.data().data();
 
-    #pragma omp parallel for schedule(dynamic)
+    // Pre-compute max degree for per-thread buffer pre-allocation
+    int32_t max_deg = 0;
+    for (std::size_t ii = 0; ii < N; ++ii) {
+        max_deg = std::max(max_deg, rp[ii + 1] - rp[ii]);
+    }
+
+    #pragma omp parallel
+    {
+    std::vector<float> attn(static_cast<std::size_t>(max_deg));
+    #pragma omp for schedule(dynamic, 64)
     for (int64_t i = 0; i < static_cast<int64_t>(N); ++i) {
         const int32_t row_start = rp[i];
         const int32_t row_end   = rp[i + 1];
@@ -1013,10 +1061,6 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
 
         const float si = src_scores[static_cast<std::size_t>(i)];
         const int32_t row_len = row_end - row_start;
-
-        // ── Phase A: Compute attention logits + row softmax ─────────────
-        //    Small per-row buffer (max-degree sized, stack-friendly)
-        std::vector<float> attn(static_cast<std::size_t>(row_len));
 
         // LeakyReLU attention logits + find row max (fused)
         float row_max = -std::numeric_limits<float>::infinity();
@@ -1065,6 +1109,7 @@ Tensor GATLayer::forward(const Tensor& A, const Tensor& H) const {
 #endif
         }
     }
+    } // omp parallel
 
     // Bias addition
     if (use_bias_) {

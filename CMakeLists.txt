@@ -44,12 +44,23 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(tinygnn_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
-# ── AVX2 + FMA intrinsics (Phase 8) ────────────────────────────────────────
+# ── AVX2 + FMA + native-arch + loop opts ───────────────────────────────────
 include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-check_cxx_compiler_flag("-mfma"  COMPILER_SUPPORTS_FMA)
-if(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+check_cxx_compiler_flag("-march=native"  COMPILER_SUPPORTS_MARCH_NATIVE)
+check_cxx_compiler_flag("-mavx2"         COMPILER_SUPPORTS_AVX2)
+check_cxx_compiler_flag("-mfma"          COMPILER_SUPPORTS_FMA)
+check_cxx_compiler_flag("-funroll-loops" COMPILER_SUPPORTS_UNROLL)
+
+if(COMPILER_SUPPORTS_MARCH_NATIVE)
+    # -march=native supersedes -mavx2/-mfma and enables every ISA extension
+    # available on the host CPU (AVX2, FMA, BMI2, POPCNT, …)
+    target_compile_options(tinygnn_core PRIVATE -march=native)
+elseif(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
     target_compile_options(tinygnn_core PRIVATE -mavx2 -mfma)
+endif()
+
+if(COMPILER_SUPPORTS_UNROLL)
+    target_compile_options(tinygnn_core PRIVATE -funroll-loops)
 endif()
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -96,14 +107,31 @@ endif() # TINYGNN_BUILD_TESTS
 
 # ── Benchmarks ─────────────────────────────────────────────────────────────
 if(TINYGNN_BUILD_BENCHMARKS)
+
+# Helper to apply the same full-opt flags to each benchmark executable
+function(target_apply_full_opts tgt)
+    if(COMPILER_SUPPORTS_MARCH_NATIVE)
+        target_compile_options(${tgt} PRIVATE -march=native)
+    elseif(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+        target_compile_options(${tgt} PRIVATE -mavx2 -mfma)
+    endif()
+    if(COMPILER_SUPPORTS_UNROLL)
+        target_compile_options(${tgt} PRIVATE -funroll-loops)
+    endif()
+endfunction()
+
 add_executable(bench_parallel benchmarks/bench_parallel.cpp)
 target_link_libraries(bench_parallel PRIVATE tinygnn_core)
+target_apply_full_opts(bench_parallel)
 
 add_executable(bench_fusion benchmarks/bench_fusion.cpp)
 target_link_libraries(bench_fusion PRIVATE tinygnn_core)
+target_apply_full_opts(bench_fusion)
 
 add_executable(bench_datasets benchmarks/bench_datasets.cpp)
 target_link_libraries(bench_datasets PRIVATE tinygnn_core)
+target_apply_full_opts(bench_datasets)
+
 endif() # TINYGNN_BUILD_BENCHMARKS
 
 # ── Installation & CMake package export ────────────────────────────────────

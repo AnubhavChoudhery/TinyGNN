@@ -267,6 +267,28 @@ def _pyg_sage_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
         with torch.no_grad(): conv(H_torch, edge_index)
     return _f
 
+def _pyg_sage_max_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
+    """PyG SAGEConv with max aggregation — matches TinyGNN SAGE-Max.
+
+    PyG SAGEConv(aggr='max') computes:
+        h_agg_i = max_{j in N(i)} h_j   (component-wise, raw features)
+        out_i   = lin_l(h_agg_i) + lin_r(h_i) + bias
+    which is identical to TinyGNN's SAGE-Max: max_agg @ Wn + H @ Ws + b.
+    """
+    torch, _, SAGEConv, _ = pyg_cls
+    conv = SAGEConv(F_in, F_out, bias=True, aggr="max", normalize=False,
+                   root_weight=True)
+    with torch.no_grad():
+        # lin_l transforms the max-aggregated neighbor vector  → Wn
+        # lin_r transforms the self feature vector             → Ws
+        conv.lin_l.weight.copy_(torch.from_numpy(w["Wn"].T))
+        conv.lin_r.weight.copy_(torch.from_numpy(w["Ws"].T))
+        conv.lin_l.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    def _f():
+        with torch.no_grad(): conv(H_torch, edge_index)
+    return _f
+
+
 def _pyg_gat_fwd(w, F_in, F_out, edge_index, H_torch, pyg_cls):
     torch, _, _, GATConv = pyg_cls
     conv = GATConv(F_in, F_out, heads=1, bias=True, negative_slope=0.2,
@@ -340,6 +362,18 @@ def run_accuracy(pyg_cls) -> List[Dict]:
     with torch.no_grad(): out_pyg = conv(H_t, ei).numpy()
     _chk("SAGELayer-Mean", out_tg, out_pyg)
 
+    # SAGE-Max
+    w = _sage_weights(F_in, F_out, seed)
+    ly = make_tg_sage(w, F_in, F_out, tg.SAGELayer.Aggregator.Max)
+    out_tg = ly.forward(A_tg, H_tg).to_numpy()
+    conv = SAGEConv(F_in, F_out, bias=True, aggr="max", normalize=False, root_weight=True)
+    with torch.no_grad():
+        conv.lin_l.weight.copy_(torch.from_numpy(w["Wn"].T))  # lin_l → neighbor max-agg
+        conv.lin_r.weight.copy_(torch.from_numpy(w["Ws"].T))  # lin_r → self
+        conv.lin_l.bias.copy_(torch.from_numpy(w["b"].flatten()))
+    with torch.no_grad(): out_pyg = conv(H_t, ei).numpy()
+    _chk("SAGELayer-Max", out_tg, out_pyg)
+
     # GAT
     w = _gat_weights(F_in, F_out, seed)
     ly = make_tg_gat(w, F_in, F_out)
@@ -409,7 +443,7 @@ def run_benchmarks(reps: int, pyg_cls) -> List[Dict]:
              lambda w, fi, fo: _pyg_sage_fwd(w, fi, fo, ei, H_t, pyg_cls)),
             ("SAGE-Max",  _sage_weights,
              lambda w, fi, fo: make_tg_sage(w, fi, fo, tg.SAGELayer.Aggregator.Max),  A_tg,
-             None),
+             lambda w, fi, fo: _pyg_sage_max_fwd(w, fi, fo, ei, H_t, pyg_cls)),
             ("GAT",       _gat_weights,
              lambda w, fi, fo: make_tg_gat(w, fi, fo),  A_sl,
              lambda w, fi, fo: _pyg_gat_fwd(w, fi, fo, ei, H_t, pyg_cls)),

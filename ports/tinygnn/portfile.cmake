@@ -1,12 +1,13 @@
 # ============================================================================
 #  TinyGNN vcpkg port  —  portfile.cmake
 #
-#  After pushing the v0.1.3 release tag to GitHub, compute SHA512:
+#  After pushing the v0.1.4 release tag to GitHub, compute SHA512:
 #
-#    Invoke-WebRequest -Uri https://github.com/AnubhavChoudheries/TinyGNN/archive/refs/tags/v0.1.3.tar.gz -OutFile v013.tar.gz
-#    (Get-FileHash v013.tar.gz -Algorithm SHA512).Hash.ToLower()
+#    Invoke-WebRequest -Uri https://github.com/AnubhavChoudhery/TinyGNN/archive/refs/tags/v0.1.4.tar.gz -OutFile v014.tar.gz
+#    (Get-FileHash v014.tar.gz -Algorithm SHA512).Hash.ToLower()
 #
-#  Replace the SHA512 placeholder below with that output.
+#  Replace the SHA512 placeholder below with that output, then submit
+#  a PR to the microsoft/vcpkg registry.
 # ============================================================================
 
 vcpkg_from_github(

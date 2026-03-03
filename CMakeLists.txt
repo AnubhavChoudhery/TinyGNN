@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TinyGNN VERSION 0.1.2 LANGUAGES CXX)
+project(TinyGNN VERSION 0.1.4 LANGUAGES CXX)
 
 # ── C++17 standard ──────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)
@@ -93,6 +93,9 @@ add_test(NAME TensorTests COMMAND test_tensor)
 add_executable(test_graph_loader tests/test_graph_loader.cpp)
 target_link_libraries(test_graph_loader PRIVATE tinygnn_core)
 add_test(NAME GraphLoaderTests COMMAND test_graph_loader)
+# Scale-simulation tests (test_reddit_scale_*) generate large in-memory graphs
+# and can take 30-300 s on CI hardware — allow up to 600 s before timing out.
+set_tests_properties(GraphLoaderTests PROPERTIES TIMEOUT 600)
 
 add_executable(test_matmul tests/test_matmul.cpp)
 target_link_libraries(test_matmul PRIVATE tinygnn_core)

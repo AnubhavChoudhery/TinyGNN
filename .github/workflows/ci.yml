@@ -8,10 +8,14 @@
 #
 #  Jobs:
 #    1. cpp-build-test     — CMake build + CTest (Linux, macOS, Windows)
-#    2. python-build-test  — pip install + pytest (Linux, Windows)
+#    2. python-build-test  — pip install + pytest (Linux, macOS, Windows)
 #    3. sanitizers         — ASan + UBSan memory safety checks (Linux)
-#    4. valgrind           — Memcheck + Helgrind (Linux)
-#    5. docs               — Build Doxygen + Sphinx documentation (Linux)
+#    4. docs               — Build Doxygen + Sphinx documentation (Linux)
+#
+#  NOTE: Valgrind (Memcheck + Helgrind) was removed from CI because the
+#  scale-simulation tests in test_graph_loader take 30-120 s unoptimised;
+#  under Valgrind (10-100× overhead) they exceed the 6-hour job limit.
+#  Run scripts/valgrind_all.sh locally for on-demand memory checking.
 # =============================================================================
 
 name: CI
@@ -173,86 +177,7 @@ jobs:
           echo "All sanitizer tests passed!"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  #  Job 4: Valgrind — Memcheck + Helgrind (Linux only)
-  # ═══════════════════════════════════════════════════════════════════════════
-  valgrind:
-    name: Valgrind (Memcheck + Helgrind)
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y valgrind g++ libomp-dev
-
-      - name: Build debug binaries (no -static; Valgrind needs dynamic symbols)
-        run: |
-          mkdir -p build/valgrind
-          SRCS_COMMON="src/tensor.cpp src/ops.cpp src/layers.cpp"
-          FLAGS="-std=c++17 -g -O0 -fno-inline -fno-omit-frame-pointer -Iinclude -fopenmp"
-          for test in test_tensor test_graph_loader test_matmul test_spmm \
-                      test_activations test_gcn test_graphsage test_gat; do
-            case "$test" in
-              test_tensor)      SRCS="src/tensor.cpp" ;;
-              test_graph_loader) SRCS="src/tensor.cpp src/graph_loader.cpp" ;;
-              test_matmul|test_spmm) SRCS="src/tensor.cpp src/ops.cpp" ;;
-              test_activations) SRCS="src/tensor.cpp src/ops.cpp" ;;
-              test_gcn|test_graphsage|test_gat) SRCS="src/tensor.cpp src/ops.cpp src/layers.cpp" ;;
-            esac
-            g++ $FLAGS $SRCS tests/${test}.cpp -o build/valgrind/${test}_vg -lgomp
-            echo "Built build/valgrind/${test}_vg"
-          done
-
-      - name: Memcheck (no leaks, no invalid access)
-        run: |
-          PASS=0; FAIL=0
-          mkdir -p build/valgrind/logs
-          for test in test_tensor test_graph_loader test_matmul test_spmm \
-                      test_activations test_gcn test_graphsage test_gat; do
-            echo "--- Memcheck: $test ---"
-            valgrind \
-              --tool=memcheck \
-              --leak-check=full \
-              --show-leak-kinds=all \
-              --track-origins=yes \
-              --errors-for-leak-kinds=all \
-              --error-exitcode=1 \
-              --log-file=build/valgrind/logs/memcheck_${test}.log \
-              build/valgrind/${test}_vg > /dev/null 2>&1 \
-              && { echo "  [PASS] memcheck $test"; PASS=$((PASS+1)); } \
-              || { echo "  [FAIL] memcheck $test"; cat build/valgrind/logs/memcheck_${test}.log | grep -E 'ERROR SUMMARY|definitely lost|Invalid' | head -10; FAIL=$((FAIL+1)); }
-          done
-          echo "Memcheck: $PASS passed, $FAIL failed"
-          [ $FAIL -eq 0 ]
-
-      - name: Helgrind (threading / data races)
-        run: |
-          PASS=0; FAIL=0
-          for test in test_tensor test_graph_loader test_matmul test_spmm \
-                      test_activations test_gcn test_graphsage test_gat; do
-            echo "--- Helgrind: $test ---"
-            valgrind \
-              --tool=helgrind \
-              --error-exitcode=1 \
-              --log-file=build/valgrind/logs/helgrind_${test}.log \
-              build/valgrind/${test}_vg > /dev/null 2>&1 \
-              && { echo "  [PASS] helgrind $test"; PASS=$((PASS+1)); } \
-              || { echo "  [FAIL] helgrind $test"; cat build/valgrind/logs/helgrind_${test}.log | grep -E 'ERROR SUMMARY' | head -5; FAIL=$((FAIL+1)); }
-          done
-          echo "Helgrind: $PASS passed, $FAIL failed"
-          [ $FAIL -eq 0 ]
-
-      - name: Upload Valgrind logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: valgrind-logs
-          path: build/valgrind/logs/
-          retention-days: 14
-
-  # ═══════════════════════════════════════════════════════════════════════════
-  #  Job 5: Documentation Build (Doxygen + Sphinx)
+  #  Job 4: Documentation Build (Doxygen + Sphinx)
   # ═══════════════════════════════════════════════════════════════════════════
   docs:
     name: Documentation

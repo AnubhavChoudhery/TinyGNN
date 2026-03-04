@@ -1,16 +1,19 @@
 # =============================================================================
-#  TinyGNN — Continuous Integration / Continuous Deployment
+#  TinyGNN — Continuous Integration
 #  .github/workflows/ci.yml
 #
 #  Triggered on:
-#    • Every push to main
-#    • Every pull request targeting main
+#    • Pull requests targeting main  (code-path changes only — see paths filter)
+#    • Manual workflow_dispatch
+#  NOT triggered on direct pushes to main (saves free-tier minutes).
+#  macOS and Windows runners have been removed from the matrix for the same
+#  reason (macOS = 10× minute multiplier, Windows = 2×).
 #
-#  Jobs:
-#    1. cpp-build-test     — CMake build + CTest (Linux, macOS, Windows)
-#    2. python-build-test  — pip install + pytest (Linux, macOS, Windows)
-#    3. sanitizers         — ASan + UBSan memory safety checks (Linux)
-#    4. docs               — Build Doxygen + Sphinx documentation (Linux)
+#  Jobs (Linux only):
+#    1. cpp-build-test    — CMake build + CTest (GCC)
+#    2. python-build-test — pip install + pytest
+#    3. sanitizers        — ASan + UBSan
+#    4. docs              — Doxygen + Sphinx
 #
 #  NOTE: Valgrind (Memcheck + Helgrind) was removed from CI because the
 #  scale-simulation tests in test_graph_loader take 30-120 s unoptimised;
@@ -21,88 +24,52 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - 'python/**'
+      - 'CMakeLists.txt'
+      - 'setup.py'
+      - 'pyproject.toml'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:   # allow manual runs from the Actions tab
 
 permissions:
   contents: read
 
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
-  #  Job 1: C++ Build + Test (CMake)
+  #  Job 1: C++ Build + Test (CMake) — Linux / GCC only
   # ═══════════════════════════════════════════════════════════════════════════
   cpp-build-test:
-    name: C++ (${{ matrix.os }}, ${{ matrix.compiler }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            compiler: gcc
-            cc: gcc
-            cxx: g++
-          - os: ubuntu-latest
-            compiler: clang
-            cc: clang
-            cxx: clang++
-          - os: macos-latest
-            compiler: clang
-            cc: clang
-            cxx: clang++
-          - os: windows-latest
-            compiler: msvc
-            cc: cl
-            cxx: cl
+    name: C++ (ubuntu, gcc)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install OpenMP (macOS)
-        if: runner.os == 'macOS'
-        run: brew install libomp
-
       - name: Configure CMake
         env:
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-          # Help CMake find Homebrew libomp on macOS (arm64 and x86)
-          OpenMP_ROOT: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
+          CC: gcc
+          CXX: g++
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Run C++ tests (Linux / macOS)
-        if: runner.os != 'Windows'
+      - name: Run C++ tests
         run: ctest --test-dir build --output-on-failure -j4
 
-      - name: Run C++ tests (Windows / MSVC multi-config)
-        if: runner.os == 'Windows'
-        run: ctest --test-dir build --output-on-failure -C Release -j4
-        # Note: test_e2e requires dataset files (skipped in CI if not present)
-
   # ═══════════════════════════════════════════════════════════════════════════
-  #  Job 2: Python Build + Test (pybind11 + pytest)
+  #  Job 2: Python Build + Test — Linux / Python 3.12 only
   # ═══════════════════════════════════════════════════════════════════════════
   python-build-test:
-    name: Python (${{ matrix.os }}, ${{ matrix.python-version }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python-version: "3.10"
-          - os: ubuntu-latest
-            python-version: "3.12"
-          - os: windows-latest
-            python-version: "3.12"
-          - os: macos-latest
-            python-version: "3.12"
+    name: Python (ubuntu, 3.12)
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -111,25 +78,13 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.12"
 
       - name: Install build dependencies
         run: pip install pybind11 numpy setuptools wheel psutil
 
-      - name: Install OpenMP (macOS)
-        if: runner.os == 'macOS'
-        run: brew install libomp
-
-      - name: Build extension (Linux/macOS)
-        if: runner.os != 'Windows'
-        # LIBOMP_PREFIX tells setup.py where to find Homebrew libomp headers/lib
-        env:
-          LIBOMP_PREFIX: ${{ runner.os == 'macOS' && '/opt/homebrew/opt/libomp' || '' }}
+      - name: Build extension
         run: python setup.py build_ext --inplace
-
-      - name: Build extension (Windows)
-        if: runner.os == 'Windows'
-        run: pip install -e .
 
       - name: Install test dependencies
         run: pip install pytest scipy

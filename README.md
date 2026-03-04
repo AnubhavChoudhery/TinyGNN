@@ -605,9 +605,7 @@ cd docs && make html                          # Python API → docs/_build/html/
 
 ## GNN Benchmark Results
 
-> **Machine-dependent results** — all numbers below were measured on an Intel Core 9 270H (20 logical threads), GCC 13.3, Python 3.11, Windows 11 + WSL2, with 10 timed repetitions per cell (median reported). Speedup figures will vary significantly with CPU core count, NUMA topology, and memory bandwidth of the host machine. On machines with fewer cores, TinyGNN-MT may be slower than TinyGNN-1T for small graphs (thread-launch overhead dominates). On machines with more NUMA nodes or slower memory, large-graph results may differ substantially.
-
-Run `python scripts/bench_gnn.py --reps 20 && python scripts/plot_gnn_bench.py` to reproduce locally.
+> **Machine-dependent results** — all numbers vary with CPU core count, NUMA topology, memory bandwidth, and OS scheduler behaviour. Results from two different hardware environments are shown below. On machines with fewer cores, TinyGNN-MT may be slower than TinyGNN-1T for very small graphs (thread-launch overhead dominates). Run `python scripts/bench_gnn.py --reps 8 && python scripts/plot_gnn_bench.py` to reproduce on your own hardware.
 
 ### Accuracy (TinyGNN vs PyTorch Geometric)
 
@@ -622,9 +620,42 @@ Synthetic graphs: N=30, F_in=8, F_out=4 — numerically identical weights fed to
 
 All differences are well within float32 rounding tolerance (< 5×10⁻⁷).
 
-### Wall-time (median ms, 10 reps)
+---
+
+### Wall-time — Jai Ansh's machine (Intel i7-12650H · 16T · Dell G15 5520)
+
+**Hardware:** Intel Core i7-12650H @ 2.30 GHz (10 cores / 16 threads), 16 GB DDR5-4800, NVIDIA RTX 3060 6 GB, Windows 11, GCC 13.3 (MinGW-UCRT64), Python 3.12. 8 timed repetitions, median reported.
 
 Graph configs: small (N=1K, deg=5, F_in=64→32), medium (N=10K, deg=10, F_in=128→64), large (N=100K, deg=5, F_in=256→128).
+
+| Graph | Layer | TinyGNN-1T | TinyGNN-16T | PyG | 16T vs 1T | 16T vs PyG |
+|-------|-------|-----------|------------|-----|-----------|-----------|
+| small-1K | GCN | 0.29 ms | 0.58 ms | 2.05 ms | 0.49× ¹ | **3.51×** |
+| small-1K | SAGE-Mean | 0.38 ms | 0.60 ms | 1.65 ms | 0.64× ¹ | **2.77×** |
+| small-1K | SAGE-Max | 0.47 ms | 0.78 ms | 2.20 ms | 0.61× ¹ | **2.83×** |
+| small-1K | GAT | 0.46 ms | 0.85 ms | 2.17 ms | 0.54× ¹ | **2.55×** |
+| medium-10K | GCN | 9.74 ms | 3.67 ms | 33.10 ms | **2.65×** | **9.02×** |
+| medium-10K | SAGE-Mean | 15.50 ms | 3.17 ms | 54.16 ms | **4.90×** | **17.11×** |
+| medium-10K | SAGE-Max | 19.67 ms | 3.63 ms | 72.93 ms | **5.42×** | **20.09×** |
+| medium-10K | GAT | 9.56 ms | 3.98 ms | 36.55 ms | **2.40×** | **9.18×** |
+| large-100K | GCN | 262.59 ms | 74.15 ms | 597.18 ms | **3.54×** | **8.05×** |
+| large-100K | SAGE-Mean | 490.37 ms | 120.10 ms | 594.53 ms | **4.08×** | **4.95×** |
+| large-100K | SAGE-Max | 519.41 ms | 89.52 ms | 1010.78 ms | **5.80×** | **11.29×** |
+| large-100K | GAT | 274.30 ms | 73.70 ms | 510.89 ms | **3.72×** | **6.93×** |
+
+¹ Small-graph thread overhead: spawning 16 threads costs more than the actual computation for N=1K graphs. Single-threaded is faster at this scale — see the speedup chart.
+
+The charts below were generated from this hardware run:
+
+![GNN Runtime Comparison](benchmarks/gnn_runtime_comparison.png)
+![GNN Speedup](benchmarks/gnn_speedup.png)
+![GNN Memory Comparison](benchmarks/gnn_memory_comparison.png)
+
+---
+
+### Wall-time — Anubhav's machine (Intel Core 9 270H · 20T)
+
+**Hardware:** Intel Core Ultra 9 270H (20 logical threads), GCC 13.3, Python 3.11, Windows 11 + WSL2. 10 timed repetitions, median reported.
 
 | Graph | Layer | TinyGNN-1T | TinyGNN-20T | PyG | 20T vs 1T | 20T vs PyG |
 |-------|-------|-----------|------------|-----|-----------|-----------|
@@ -641,11 +672,17 @@ Graph configs: small (N=1K, deg=5, F_in=64→32), medium (N=10K, deg=10, F_in=12
 | large-100K | SAGE-Max | 390.84 ms | 71.53 ms | 393.57 ms | **5.46×** | **5.50×** |
 | large-100K | GAT | 281.61 ms | 79.85 ms | 253.06 ms | **3.53×** | **3.17×** |
 
-¹ Small-graph thread overhead: on this 20-core CPU, spawning 20 threads costs more than the actual computation for N=1K graphs. Single-threaded is faster at this scale — see the speedup chart.
+¹ Small-graph thread overhead: on a 20-core CPU, spawning 20 threads costs more than the computation for N=1K. Single-threaded is faster at this scale.
 
+### (Important note the links and png s below are from Anubhav's system)
 ![GNN Runtime Comparison](benchmarks/gnn_runtime_comparison.png)
 ![GNN Speedup](benchmarks/gnn_speedup.png)
 ![GNN Memory Comparison](benchmarks/gnn_memory_comparison.png)
+
+### (Important note the links and png s below are from Jai Ansh's system)
+![GNN Runtime Comparison](benchmarks_jai/gnn_runtime_comparison.png)
+![GNN Speedup](benchmarks_jai/gnn_speedup.png)
+![GNN Memory Comparison](benchmarks_jai/gnn_memory_comparison.png)
 
 ### Working-set memory (analytical estimate)
 
@@ -667,8 +704,9 @@ Every push to `main` and every pull request automatically triggers GitHub Action
 - **C++ build + test** on Linux (GCC + Clang), macOS, and Windows (MSVC)
 - **Python build + test** on Linux, macOS, Windows (Python 3.10 + 3.12)
 - **ASan + UBSan** sanitizer checks on Linux
-- **Valgrind** Memcheck + Helgrind on Linux
 - **Documentation build** (Doxygen + Sphinx)
+
+Valgrind Memcheck + Helgrind can be run locally via `bash scripts/valgrind_all.sh` (excluded from CI due to runtime overhead on large graph tests).
 
 ---
 

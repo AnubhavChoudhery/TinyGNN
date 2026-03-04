@@ -106,104 +106,560 @@ TinyGNN/
 
 ## Installation
 
-### Quick Install (PyPI)
-
-The simplest way to install TinyGNN:
+### Option 1 — PyPI (Python users)
 
 ```bash
 pip install tinygnn
 ```
 
-### Install from Source (Development)
+Installs the pre-built Python extension wheel (`_tinygnn_core`) plus the `tinygnn` Python package. Supports Python 3.8–3.13 on Linux, macOS, and Windows (x86-64).
+
+#### Development install from source
+```bash
+git clone https://github.com/AnubhavChoudhery/TinyGNN.git
+cd TinyGNN
+pip install -e ".[dev]"    # builds the C++ extension in-place + installs dev deps
+```
+
+#### Verify the install
+```bash
+python -c "import tinygnn; print(tinygnn.__version__)"    # → 0.1.4
+python -m pytest tests/test_python_bindings.py -v         # 49 tests
+python scripts/validate_cora.py --logit-check             # PyG logit comparison
+```
+
+---
+
+### Option 2 — vcpkg (C++ projects)
+
+TinyGNN ships a vcpkg port at `ports/tinygnn/`. Once the v0.1.4 release tag is pushed to GitHub, install it as:
 
 ```bash
-git clone https://github.com/JaiAnshSB/TinyGNN.git
-cd TinyGNN
-pip install -e ".[dev]"
+# 1. Add TinyGNN's vcpkg overlay to your project's vcpkg manifest
+#    (or drop ports/tinygnn/ into your own vcpkg overlay registry)
+vcpkg install tinygnn --overlay-ports=./ports
 ```
 
-This builds the C++ extension in-place and installs development dependencies.
-
-### Python Usage
-
-```python
-import tinygnn
-import numpy as np
-
-# Create tensors from NumPy
-X = tinygnn.Tensor.from_numpy(np.random.randn(10, 16).astype(np.float32))
-print(f"Shape: {X.rows} x {X.cols}")  # 10 x 16
-
-# Build a GCN model
-model = tinygnn.Model()
-model.add_gcn_layer(1433, 64, activation=tinygnn.Activation.RELU)
-model.add_gcn_layer(64, 7, activation=tinygnn.Activation.NONE)
-model.load_weights("weights/gcn_cora.bin")
-
-# Run inference
-cora = tinygnn.load_cora_binary("weights/cora_graph.bin")
-logits = model.forward(cora.adjacency, cora.features)
-predictions = logits.to_numpy().argmax(axis=1)
-print(f"Predicted classes: {np.unique(predictions)}")
+Then in your project's `CMakeLists.txt`:
+```cmake
+find_package(tinygnn CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE tinygnn::tinygnn_core)
 ```
 
-### C++ Only (No Python)
+That's the only integration step needed — all include directories and OpenMP flags are propagated automatically via the imported target.
+
+**vcpkg.json** (for manifest-mode projects):
+```json
+{
+  "dependencies": [
+    { "name": "tinygnn", "version>=": "0.1.4" }
+  ],
+  "overrides": [
+    { "name": "tinygnn", "version": "0.1.4" }
+  ]
+}
+```
+
+> **Note:** The port's `SHA512` in `portfile.cmake` is a placeholder until the GitHub release tag is live. See `ports/tinygnn/portfile.cmake` for the SHA computation steps.
+
+---
+
+### Option 3 — Build from source (C++ only)
 
 #### Prerequisites
-- C++17-capable compiler (GCC 8+, Clang 7+, MSVC 2019+)
-- CMake 3.16+  *(optional -- g++ directly also works)*
-- OpenMP (usually bundled with GCC; optional but recommended for parallelism)
-- CPU with AVX2 + FMA support (Intel Haswell+ / AMD Zen+; optional, scalar fallback provided)
+- C++17-capable compiler: GCC 8+, Clang 7+, MSVC 2019+
+- CMake 3.16+ *(optional — g++ directly also works)*
+- OpenMP *(bundled with GCC; for macOS use `brew install libomp`)*
+- CPU with AVX2 + FMA *(Intel Haswell+ / AMD Zen+; scalar fallback always available)*
 
 #### With CMake
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
-ctest --test-dir build --output-on-failure --config Release
+ctest --test-dir build -C Release --output-on-failure
 ```
 
-#### Directly with g++ (example)
+CMake options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `TINYGNN_BUILD_TESTS` | `ON` | Build test executables |
+| `TINYGNN_BUILD_BENCHMARKS` | `ON` | Build C++ benchmark executables |
+
+#### Directly with g++ (single test example)
 ```bash
-# All tests at once (with OpenMP + AVX2)
 g++ -std=c++17 -O2 -fopenmp -mavx2 -mfma -Wall -Wextra -I include \
     src/tensor.cpp src/graph_loader.cpp src/ops.cpp src/layers.cpp src/model.cpp \
     tests/test_tensor.cpp -o build/test_tensor && ./build/test_tensor
 ```
 
-### Python Extension
-```bash
-pip install -e ".[dev]"                                   # development install
-python -m pytest tests/test_python_bindings.py -v         # run Python tests
-python scripts/validate_cora.py --logit-check             # PyG logit comparison
+---
+
+## Python SDK Reference
+
+Install: `pip install tinygnn`
+
+### Tensor
+
+```python
+import tinygnn
+import numpy as np
+from scipy.sparse import csr_matrix
+
+# Dense tensors from NumPy (float32)
+arr = np.random.randn(10, 16).astype(np.float32)
+X = tinygnn.Tensor.from_numpy(arr)
+print(X.rows, X.cols)           # 10, 16
+out = X.to_numpy()              # → np.ndarray shape (10, 16)
+
+# 1-D arrays (bias vectors) → (1 × N) Tensor
+b = tinygnn.Tensor.from_numpy_1d(np.zeros(16, dtype=np.float32))
+
+# Sparse CSR from SciPy
+mat = csr_matrix(...)
+A = tinygnn.Tensor.from_scipy_csr(mat)
+
+# Sparse CSR from PyG edge_index
+import torch
+ei = torch.randint(0, 100, (2, 500))
+A = tinygnn.Tensor.from_edge_index(ei, num_nodes=100)
+
+# Inspect CSR internals
+rp = A.row_ptr_numpy()    # → np.ndarray int32
+ci = A.col_ind_numpy()    # → np.ndarray int32
 ```
 
-### Benchmarks
-```bash
-# Thread-scaling (OpenMP + AVX2)
-cmake --build build --target bench_parallel && ./build/bench_parallel
+### Ops
 
-# Operator fusion (fused vs unfused GAT/SAGE)
-cmake --build build --target bench_fusion && OMP_NUM_THREADS=8 ./build/bench_fusion
+```python
+# Dense GEMM
+C = tinygnn.matmul(A, B)   # Dense A (M×K), Dense B (K×N) → Dense C (M×N)
 
-# Massif memory profiling (requires Valgrind on Linux)
-bash scripts/run_massif_phase9.sh
+# Sparse-Dense SpMM
+C = tinygnn.spmm(A, B)     # SparseCSR A (M×K), Dense B (K×N) → Dense C (M×N)
+
+# In-place activations
+tinygnn.relu_inplace(X)
+tinygnn.leaky_relu_inplace(X, alpha=0.01)
+tinygnn.elu_inplace(X, alpha=1.0)
+tinygnn.sigmoid_inplace(X)
+tinygnn.tanh_inplace(X)
+tinygnn.gelu_inplace(X)
+tinygnn.softmax_inplace(X)        # row-wise, numerically stable
+tinygnn.log_softmax_inplace(X)    # row-wise log-softmax
+
+# Bias broadcast  (X[i][j] += bias[0][j])
+tinygnn.add_bias(X, bias)
 ```
 
-### Memory Safety (WSL / Linux)
+### Graph utilities
+
+```python
+A_sl   = tinygnn.add_self_loops(A)      # insert identity self-loops
+A_norm = tinygnn.gcn_norm(A)            # D̃^(-1/2)(A+I)D̃^(-1/2), adds self-loops
+alpha  = tinygnn.edge_softmax(attn_csr) # sparse row-wise softmax
+agg    = tinygnn.sage_max_aggregate(A, H)  # CSR neighborhood max-pool
+```
+
+### Layers
+
+```python
+import tinygnn
+
+# GCN layer  (A must be gcn_norm output)
+gcn = tinygnn.GCNLayer(F_in=64, F_out=32, bias=True,
+                        activation=tinygnn.Activation.RELU)
+gcn.set_weight(tinygnn.Tensor.from_numpy(W))     # Dense (F_in × F_out)
+gcn.set_bias(tinygnn.Tensor.from_numpy_1d(b))
+H2 = gcn.forward(A_norm, H)
+
+# GraphSAGE layer
+sage = tinygnn.SAGELayer(F_in=64, F_out=32,
+                          aggregator=tinygnn.SAGELayer.Aggregator.Mean,
+                          bias=True,
+                          activation=tinygnn.Activation.RELU)
+# Aggregator.Mean | Aggregator.Max
+sage.set_weight_neigh(tinygnn.Tensor.from_numpy(Wn))
+sage.set_weight_self(tinygnn.Tensor.from_numpy(Ws))
+sage.set_bias(tinygnn.Tensor.from_numpy_1d(b))
+H2 = sage.forward(A, H)    # A is raw adjacency (no gcn_norm)
+
+# GAT layer  (A must include self-loops via add_self_loops)
+gat = tinygnn.GATLayer(F_in=64, F_out=32, negative_slope=0.2,
+                        bias=True, activation=tinygnn.Activation.NONE)
+gat.set_weight(tinygnn.Tensor.from_numpy(W))
+gat.set_attn_left(tinygnn.Tensor.from_numpy(al))
+gat.set_attn_right(tinygnn.Tensor.from_numpy(ar))
+gat.set_bias(tinygnn.Tensor.from_numpy_1d(b))
+H2 = gat.forward(A_sl, H)
+```
+
+### End-to-end: two-layer GCN on Cora
+
+```python
+import tinygnn
+import numpy as np
+
+# Load pre-trained weights (produced by scripts/train_cora.py)
+cora = tinygnn.load_cora_binary("weights/cora_graph.bin")
+
+model = tinygnn.Model()
+model.add_gcn_layer(1433, 64, bias=True, activation=tinygnn.Activation.RELU)
+model.add_gcn_layer(64,   7,  bias=True, activation=tinygnn.Activation.NONE)
+model.load_weights("weights/gcn_cora.bin")
+
+logits      = model.forward(cora.adjacency, cora.features)  # Dense (2708 × 7)
+predictions = logits.to_numpy().argmax(axis=1)               # (2708,) int
+
+test_mask   = np.array(cora.test_mask)
+labels      = np.array(cora.labels)
+accuracy    = (predictions[test_mask] == labels[test_mask]).mean()
+print(f"Test accuracy: {accuracy:.1%}")   # → ~78%
+```
+
+### Enumerations
+
+```python
+tinygnn.StorageFormat.Dense        # 0
+tinygnn.StorageFormat.SparseCSR    # 1
+
+tinygnn.Activation.NONE
+tinygnn.Activation.RELU
+tinygnn.Activation.ELU
+tinygnn.Activation.SIGMOID
+tinygnn.Activation.TANH
+tinygnn.Activation.LEAKY_RELU
+tinygnn.Activation.GELU
+tinygnn.Activation.SOFTMAX
+tinygnn.Activation.LOG_SOFTMAX
+
+tinygnn.SAGELayer.Aggregator.Mean
+tinygnn.SAGELayer.Aggregator.Max
+```
+
+### GraphLoader (Python)
+
+```python
+from tinygnn import GraphLoader
+
+# Parse CSVs directly in Python
+edges = GraphLoader.parse_edges("datasets/cora/edges.csv")
+feats = GraphLoader.parse_features("datasets/cora/features.csv")
+adj   = GraphLoader.edge_list_to_csr(edges, num_nodes=2708)
+
+# Or use the full pipeline
+data = GraphLoader.load("datasets/cora/edges.csv",
+                        "datasets/cora/features.csv")
+```
+
+---
+
+## SDK Reference (C++ API)
+
+Include the top-level headers — all APIs are in the global namespace:
+
+```cpp
+#include "tinygnn/tensor.hpp"       // Tensor, StorageFormat
+#include "tinygnn/graph_loader.hpp" // GraphLoader, GraphData
+#include "tinygnn/ops.hpp"          // matmul, spmm, activations, utilities
+#include "tinygnn/layers.hpp"       // GCNLayer, SAGELayer, GATLayer
+#include "tinygnn/model.hpp"        // Model, load_cora_binary, load_weight_file
+```
+
+Link with `tinygnn::tinygnn_core` (CMake) or compile with all `.cpp` files under `src/`.
+
+### Tensor
+
+```cpp
+// --- Construction (Dense) ---
+Tensor t(rows, cols);                         // zero-initialized row-major float32
+Tensor t(rows, cols, {v00, v01, ...});        // from initializer list
+
+// --- Construction (SparseCSR) ---
+Tensor t(rows, cols,
+         std::vector<float>   values,
+         std::vector<int32_t> row_ptr,        // size rows+1
+         std::vector<int32_t> col_ind);
+
+// --- Inspection ---
+t.rows();                   // number of rows
+t.cols();                   // number of columns
+t.nnz();                    // non-zeros (SparseCSR only)
+t.format();                 // StorageFormat::Dense | SparseCSR
+t.memory_footprint_bytes(); // exact byte count including all arrays
+
+// --- Element access (Dense only) ---
+float v = t.at(i, j);      // bounds-checked read
+t.set(i, j, value);        // bounds-checked write
+float* p = t.data_ptr();   // raw pointer (row-major)
+
+// --- CSR accessors (SparseCSR only) ---
+const float*   t.csr_values();
+const int32_t* t.csr_row_ptr();
+const int32_t* t.csr_col_ind();
+```
+
+### Graph Utilities
+
+```cpp
+#include "tinygnn/ops.hpp"
+
+// Add identity self-loops (modifies CSR structure)
+Tensor A_sl = add_self_loops(A);
+
+// Symmetric GCN normalization:  D̃^(-1/2) (A+I) D̃^(-1/2)
+// (implicitly adds self-loops; pass raw adjacency, not add_self_loops output)
+Tensor A_norm = gcn_norm(A);
+
+// Sparse row-wise softmax over CSR non-zeros (attention weights)
+Tensor alpha = edge_softmax(attention_csr);
+
+// CSR neighborhood max-pooling: max_{j in N(i)} H[j]  per row
+Tensor agg = sage_max_aggregate(A, H);
+```
+
+### Graph I/O
+
+```cpp
+#include "tinygnn/graph_loader.hpp"
+
+// Load Cora binary (produced by scripts/train_cora.py)
+GraphData data = load_cora_binary("weights/cora_graph.bin");
+// data.adjacency  → SparseCSR Tensor  (N × N)
+// data.features   → Dense Tensor      (N × F)
+// data.labels     → std::vector<int>
+// data.train_mask, val_mask, test_mask → std::vector<bool>
+
+// Parse arbitrary CSV graphs
+auto edges    = GraphLoader::parse_edges("edges.csv");
+Tensor feats  = GraphLoader::parse_features("features.csv");
+Tensor adj    = GraphLoader::edge_list_to_csr(edges, num_nodes);
+
+// Full pipeline shortcut
+GraphData gd  = GraphLoader::load("edges.csv", "features.csv");
+```
+
+### Layers
+
+All layers implement `Tensor forward(const Tensor& A, const Tensor& H)`.
+
+```cpp
+#include "tinygnn/layers.hpp"
+
+// --- GCN (Kipf & Welling, ICLR 2017) ---
+// A must be pre-normalized: A_norm = gcn_norm(raw_adj)
+GCNLayer gcn(F_in, F_out, /*bias=*/true, Activation::ReLU);
+gcn.set_weight(W);    // Dense Tensor F_in × F_out
+gcn.set_bias(b);      // Dense Tensor 1 × F_out
+Tensor H2 = gcn.forward(A_norm, H);
+
+// --- GraphSAGE (Hamilton et al., NeurIPS 2017) ---
+// A is raw (un-normalized) adjacency; module handles degree normalization
+SAGELayer sage(F_in, F_out, SAGELayer::Aggregator::Mean, /*bias=*/true, Activation::ReLU);
+// SAGELayer::Aggregator::Mean | Max
+sage.set_weight_neigh(Wn);    // F_in × F_out
+sage.set_weight_self(Ws);     // F_in × F_out
+sage.set_bias(b);
+Tensor H2 = sage.forward(A, H);
+
+// --- GAT (Veličković et al., ICLR 2018) ---
+// A must include self-loops: A_sl = add_self_loops(raw_adj)
+GATLayer gat(F_in, F_out, /*negative_slope=*/0.2f, /*bias=*/true, Activation::None);
+gat.set_weight(W);          // F_in × F_out
+gat.set_attn_left(al);      // 1 × F_out  (destination attention)
+gat.set_attn_right(ar);     // 1 × F_out  (source attention)
+gat.set_bias(b);
+Tensor H2 = gat.forward(A_sl, H);
+```
+
+### Model (multi-layer execution graph)
+
+```cpp
+#include "tinygnn/model.hpp"
+
+Model model;
+
+// Add layers in forward order
+model.add_gcn_layer(1433, 64, /*bias=*/true, Activation::ReLU);
+model.add_gcn_layer(64, 7,    /*bias=*/true, Activation::None);
+
+// Load PyG-exported weights (TGNN binary format)
+model.load_weights("weights/gcn_cora.bin");
+
+// Run inference
+GraphData cora = load_cora_binary("weights/cora_graph.bin");
+Tensor logits  = model.forward(cora.adjacency, cora.features);
+// → Dense Tensor (N × num_classes), call log_softmax_inplace for probabilities
+```
+
+### Compute Ops
+
+```cpp
+#include "tinygnn/ops.hpp"
+
+// Dense GEMM:  C = A × B    (A: M×K Dense, B: K×N Dense → C: M×N Dense)
+Tensor C = matmul(A, B);
+
+// Sparse-Dense SpMM:  C = A × B    (A: M×K SparseCSR, B: K×N Dense → C: M×N Dense)
+Tensor C = spmm(A, B);
+
+// In-place activations (Dense only)
+relu_inplace(X);
+leaky_relu_inplace(X, /*alpha=*/0.01f);
+elu_inplace(X, /*alpha=*/1.0f);
+sigmoid_inplace(X);
+tanh_inplace(X);
+gelu_inplace(X);
+softmax_inplace(X);       // row-wise; with max-subtraction stability
+log_softmax_inplace(X);   // row-wise; numerically stable
+
+// Bias broadcast  X[i][j] += bias[0][j]  for all i
+add_bias(X, bias);        // bias: Dense 1 × F
+```
+
+---
+
+## CLI Reference (Python Scripts)
+
+All scripts live under `scripts/`. Run with the active Python environment.
+
+### Fetch datasets
+
 ```bash
-bash scripts/sanitizers.sh       # 27 sanitizer configs across all phases
+python scripts/fetch_datasets.py               # Cora + Reddit
+python scripts/fetch_datasets.py --cora-only   # Cora only (~170 KB)
+```
+
+Writes to `datasets/cora/` and `datasets/reddit/` (gitignored).
+
+### Train & export Cora weights
+
+```bash
+# Prerequisite: pip install torch torch_geometric
+python scripts/train_cora.py
+```
+
+Trains GCN, GraphSAGE (Mean), and GAT on Cora; exports `weights/gcn_cora.bin`, `weights/sage_cora.bin`, `weights/gat_cora.bin`, and `weights/cora_graph.bin`.
+
+### Validate logit-level agreement
+
+```bash
+python scripts/validate_cora.py               # weight-file accuracy check
+python scripts/validate_cora.py --logit-check # fresh PyG train → logit diff
+```
+
+### Run GNN benchmarks
+
+```bash
+python scripts/bench_gnn.py                   # 8 reps (default)
+python scripts/bench_gnn.py --reps 20         # smoother medians
+python scripts/bench_gnn.py --no-bench        # accuracy checks only
+python scripts/bench_gnn.py --no-accuracy     # timing only
+python scripts/bench_gnn.py --csv path/out.csv  # custom CSV prefix
+```
+
+Writes `benchmarks/gnn_bench_results_timing.csv` and `benchmarks/gnn_bench_results_accuracy.csv`.
+
+### Generate benchmark charts
+
+```bash
+python scripts/plot_gnn_bench.py    # produces 5 PNGs in benchmarks/
+```
+
+| Output file | Contents |
+|-------------|----------|
+| `gnn_runtime_comparison.png` | Wall-time per layer & graph size |
+| `gnn_memory_comparison.png` | Working-set memory (analytical, log scale) |
+| `gnn_speedup.png` | TinyGNN-NT vs TinyGNN-1T and vs PyG |
+| `gnn_scaling.png` | Runtime scaling with graph size |
+| `gnn_accuracy.png` | TinyGNN vs PyG max absolute logit diff |
+
+### Thread-scaling and operator-fusion benchmarks
+
+```bash
+cmake --build build --target bench_parallel
+./build/bench_parallel                        # OpenMP thread-scaling report
+
+cmake --build build --target bench_fusion
+OMP_NUM_THREADS=8 ./build/bench_fusion        # fused vs unfused GAT/SAGE
+
+python scripts/plot_scaling.py                # → benchmarks/thread_scaling.png
+```
+
+### Memory safety (Linux / WSL)
+
+```bash
+bash scripts/sanitizers.sh       # ASan + UBSan, 27 configs across all phases
 bash scripts/valgrind_all.sh     # Memcheck + Helgrind + Callgrind
 ```
 
-### Building Documentation
-```bash
-# C++ API docs (Doxygen)
-doxygen Doxyfile                 # → docs/doxygen/html/index.html
+### Documentation
 
-# Python docs (Sphinx)
+```bash
+doxygen Doxyfile                              # C++ API → docs/doxygen/html/
 pip install sphinx sphinx-rtd-theme breathe
-cd docs && make html             # → docs/_build/html/index.html
+cd docs && make html                          # Python API → docs/_build/html/
 ```
+
+---
+
+## GNN Benchmark Results
+
+> **Machine-dependent results** — all numbers below were measured on an Intel Core 9 270H (20 logical threads), GCC 13.3, Python 3.11, Windows 11 + WSL2, with 10 timed repetitions per cell (median reported). Speedup figures will vary significantly with CPU core count, NUMA topology, and memory bandwidth of the host machine. On machines with fewer cores, TinyGNN-MT may be slower than TinyGNN-1T for small graphs (thread-launch overhead dominates). On machines with more NUMA nodes or slower memory, large-graph results may differ substantially.
+
+Run `python scripts/bench_gnn.py --reps 20 && python scripts/plot_gnn_bench.py` to reproduce locally.
+
+### Accuracy (TinyGNN vs PyTorch Geometric)
+
+Synthetic graphs: N=30, F_in=8, F_out=4 — numerically identical weights fed to both engines.
+
+| Layer | max\|diff\| | mean\|diff\| | Pass |
+|-------|------------|-------------|------|
+| GCNLayer | 2.38e-07 | 4.32e-08 | ✅ |
+| SAGELayer-Mean | 4.77e-07 | 7.74e-08 | ✅ |
+| SAGELayer-Max | 4.77e-07 | 1.25e-07 | ✅ |
+| GATLayer | 1.79e-07 | 4.90e-08 | ✅ |
+
+All differences are well within float32 rounding tolerance (< 5×10⁻⁷).
+
+### Wall-time (median ms, 10 reps)
+
+Graph configs: small (N=1K, deg=5, F_in=64→32), medium (N=10K, deg=10, F_in=128→64), large (N=100K, deg=5, F_in=256→128).
+
+| Graph | Layer | TinyGNN-1T | TinyGNN-20T | PyG | 20T vs 1T | 20T vs PyG |
+|-------|-------|-----------|------------|-----|-----------|-----------|
+| small-1K | GCN | 0.42 ms | 0.84 ms | 1.29 ms | 0.49× ¹ | 1.54× |
+| small-1K | SAGE-Mean | 0.50 ms | 0.73 ms | 1.14 ms | 0.68× ¹ | 1.55× |
+| small-1K | SAGE-Max | 0.46 ms | 0.75 ms | 1.61 ms | 0.62× ¹ | 2.15× |
+| small-1K | GAT | 0.56 ms | 1.20 ms | 1.67 ms | 0.47× ¹ | 1.39× |
+| medium-10K | GCN | 8.07 ms | 3.67 ms | 14.93 ms | **2.20×** | **4.07×** |
+| medium-10K | SAGE-Mean | 14.23 ms | 6.20 ms | 24.03 ms | **2.29×** | **3.87×** |
+| medium-10K | SAGE-Max | 11.70 ms | 5.23 ms | 35.29 ms | **2.24×** | **6.74×** |
+| medium-10K | GAT | 8.62 ms | 3.64 ms | 18.31 ms | **2.37×** | **5.04×** |
+| large-100K | GCN | 211.51 ms | 55.99 ms | 208.67 ms | **3.78×** | **3.73×** |
+| large-100K | SAGE-Mean | 390.21 ms | 82.47 ms | 258.09 ms | **4.73×** | **3.13×** |
+| large-100K | SAGE-Max | 390.84 ms | 71.53 ms | 393.57 ms | **5.46×** | **5.50×** |
+| large-100K | GAT | 281.61 ms | 79.85 ms | 253.06 ms | **3.53×** | **3.17×** |
+
+¹ Small-graph thread overhead: on this 20-core CPU, spawning 20 threads costs more than the actual computation for N=1K graphs. Single-threaded is faster at this scale — see the speedup chart.
+
+![GNN Runtime Comparison](benchmarks/gnn_runtime_comparison.png)
+![GNN Speedup](benchmarks/gnn_speedup.png)
+![GNN Memory Comparison](benchmarks/gnn_memory_comparison.png)
+
+### Working-set memory (analytical estimate)
+
+Memory is computed analytically from tensor dimensions rather than measured at runtime (C++ heap is invisible to Python memory profilers):
+
+| Graph | Layer | TinyGNN | PyG estimate | PyG / TinyGNN |
+|-------|-------|---------|-------------|---------------|
+| small-1K | GCN | 0.58 MB | 1.11 MB | 1.93× |
+| medium-10K | GCN | 11.36 MB | 22.02 MB | 1.94× |
+| large-100K | GCN | 203.45 MB | 403.03 MB | 1.98× |
+
+TinyGNN uses roughly **2× less working-set memory** than PyG across all tested scales, reflecting the absence of PyTorch tensor metadata, autograd buffers, and COO→CSR conversion overhead.
+
+---
 
 ### CI/CD
 
@@ -211,6 +667,7 @@ Every push to `main` and every pull request automatically triggers GitHub Action
 - **C++ build + test** on Linux (GCC + Clang), macOS, and Windows (MSVC)
 - **Python build + test** on Linux, macOS, Windows (Python 3.10 + 3.12)
 - **ASan + UBSan** sanitizer checks on Linux
+- **Valgrind** Memcheck + Helgrind on Linux
 - **Documentation build** (Doxygen + Sphinx)
 
 ---
@@ -1096,6 +1553,8 @@ CMake automatically detects OpenMP and AVX2/FMA support via `find_package(OpenMP
 
 ### Benchmark Results
 
+> **Machine-dependent results** — numbers below measured on Intel Core 9 270H (20 logical threads), GCC 13.3, Ubuntu 24.04 (WSL2). Thread counts, memory bandwidth, and topology will produce different speedup figures on other hardware.
+
 Tested on Intel Core 9 270H (20 threads), GCC 13.3, Ubuntu 24.04 (WSL2):
 
 #### Cora-scale (2,708 nodes x 1,433 features, avg degree 3.9)
@@ -1179,6 +1638,8 @@ This eliminates the **N × F_in** aggregation tensor and the **N × F_out** h_se
 
 ### Benchmark Results
 
+> **Machine-dependent results** — fused vs. unfused timings below are representative for AVX2 CPUs with multi-level caches. The crossover point (where fusion starts winning) shifts with L2/L3 cache size and memory bandwidth.
+
 Tested on Intel Core 9 270H (8 threads), GCC 13.3, Ubuntu 24.04 (WSL2):
 
 #### GAT: Fused SpSDDMM + edge_softmax + SpMM
@@ -1245,13 +1706,14 @@ pip install tinygnn
 
 ### CI/CD (GitHub Actions)
 
-Every push to `main` and every PR triggers 4 parallel jobs:
+Every push to `main` and every PR triggers 5 parallel jobs:
 
 | Job | Platform | What it does |
 |-----|----------|-------------|
 | **C++ Build + Test** | Ubuntu (GCC + Clang), macOS, Windows (MSVC) | CMake build → CTest (18,000+ assertions) |
 | **Python Build + Test** | Ubuntu (3.10, 3.12), macOS (3.12), Windows (3.12) | pip install → pytest (49 tests) |
-| **Sanitizers** | Ubuntu (GCC) | ASan + UBSan + leak detection on all C++ tests |
+| **Sanitizers** | Ubuntu (GCC) | ASan + UBSan + leak detection (`-DCMAKE_EXE_LINKER_FLAGS`) |
+| **Valgrind** | Ubuntu (GCC) | Memcheck (0 errors, 0 leaks) + Helgrind (0 data races) |
 | **Documentation** | Ubuntu | Doxygen (C++) + Sphinx (Python) → artifact upload |
 
 ### Documentation

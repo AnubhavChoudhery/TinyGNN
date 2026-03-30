@@ -123,44 +123,10 @@ pip install -e ".[dev]"    # builds the C++ extension in-place + installs dev de
 
 #### Verify the install
 ```bash
-python -c "import tinygnn; print(tinygnn.__version__)"    # → 0.1.4
+python -c "import tinygnn; print(tinygnn.__version__)"    # → 0.1.5
 python -m pytest tests/test_python_bindings.py -v         # 49 tests
 python scripts/validate_cora.py --logit-check             # PyG logit comparison
 ```
-
----
-
-### Option 2 — vcpkg (C++ projects)
-
-TinyGNN ships a vcpkg port at `ports/tinygnn/`. Once the v0.1.4 release tag is pushed to GitHub, install it as:
-
-```bash
-# 1. Add TinyGNN's vcpkg overlay to your project's vcpkg manifest
-#    (or drop ports/tinygnn/ into your own vcpkg overlay registry)
-vcpkg install tinygnn --overlay-ports=./ports
-```
-
-Then in your project's `CMakeLists.txt`:
-```cmake
-find_package(tinygnn CONFIG REQUIRED)
-target_link_libraries(my_app PRIVATE tinygnn::tinygnn_core)
-```
-
-That's the only integration step needed — all include directories and OpenMP flags are propagated automatically via the imported target.
-
-**vcpkg.json** (for manifest-mode projects):
-```json
-{
-  "dependencies": [
-    { "name": "tinygnn", "version>=": "0.1.4" }
-  ],
-  "overrides": [
-    { "name": "tinygnn", "version": "0.1.4" }
-  ]
-}
-```
-
-> **Note:** The port's `SHA512` in `portfile.cmake` is a placeholder until the GitHub release tag is live. See `ports/tinygnn/portfile.cmake` for the SHA computation steps.
 
 ---
 

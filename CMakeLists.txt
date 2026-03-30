@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(TinyGNN VERSION 0.1.4 LANGUAGES CXX)
+project(TinyGNN VERSION 0.1.5 LANGUAGES CXX)
 
 # ── C++17 standard ──────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 17)

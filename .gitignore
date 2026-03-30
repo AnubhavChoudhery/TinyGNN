@@ -73,3 +73,6 @@ docs/_build/
 
 # GitHub Actions local testing
 .act/
+
+# vcpkg port
+ports/

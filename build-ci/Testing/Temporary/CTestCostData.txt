@@ -1,0 +1,10 @@
+TensorTests 2 0.0721913
+GraphLoaderTests 1 286.036
+MatmulTests 2 0.0288086
+SpmmTests 2 0.0281457
+ActivationsTests 2 0.0204883
+GCNTests 2 0.0217553
+GraphSAGETests 2 0.017149
+GATTests 2 0.0163132
+E2ETests 2 0.0105503
+---

@@ -38,3 +38,5 @@ prune venv
 prune datasets
 prune weights
 prune .git
+
+prune ports

@@ -76,3 +76,5 @@ docs/_build/
 
 # vcpkg port
 ports/
+ports\tinygnn/
+

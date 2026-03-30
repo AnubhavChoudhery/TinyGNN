@@ -160,18 +160,13 @@ ext_modules = [
 
 setup(
     name="tinygnn",
-    packages=["tinygnn", "tinygnn.tests"],
+    packages=["tinygnn", "tinygnn.tests", "scripts"],
     package_dir={
         "tinygnn":       os.path.join("python", "tinygnn"),
         "tinygnn.tests": os.path.join("python", "tinygnn", "tests"),
+        "scripts":       "scripts",
     },
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExt},
-    entry_points={
-        "console_scripts": [
-            "tinygnn-test = tinygnn.tests.smoke_tests:_main",
-            "tinygnn-bench = scripts.bench_gnn:main",
-        ],
-    },
     zip_safe=False,
 )
